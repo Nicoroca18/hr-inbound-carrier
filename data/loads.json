@@ -1,0 +1,47 @@
+[
+  {
+    "load_id": "L001",
+    "origin": "New York, NY",
+    "destination": "Los Angeles, CA",
+    "pickup_datetime": "2025-10-05T09:00:00Z",
+    "delivery_datetime": "2025-10-07T18:00:00Z",
+    "equipment_type": "Flatbed",
+    "loadboard_rate": 1500,
+    "notes": "Fragile cargo, handle with care",
+    "weight": 12000,
+    "commodity_type": "Electronics",
+    "num_of_pieces": 10,
+    "miles": 2800,
+    "dimensions": "40x48x60"
+  },
+  {
+    "load_id": "L002",
+    "origin": "Chicago, IL",
+    "destination": "Miami, FL",
+    "pickup_datetime": "2025-10-06T08:00:00Z",
+    "delivery_datetime": "2025-10-08T20:00:00Z",
+    "equipment_type": "Reefer",
+    "loadboard_rate": 1200,
+    "notes": "Keep temperature at 0-5°C",
+    "weight": 8000,
+    "commodity_type": "Pharmaceuticals",
+    "num_of_pieces": 20,
+    "miles": 1400,
+    "dimensions": "48x48x48"
+  },
+  {
+    "load_id": "L003",
+    "origin": "Atlanta, GA",
+    "destination": "Chicago, IL",
+    "pickup_datetime": "2025-10-07T08:00:00Z",
+    "delivery_datetime": "2025-10-08T18:00:00Z",
+    "equipment_type": "Dry Van",
+    "loadboard_rate": 900,
+    "notes": "No special conditions",
+    "weight": 6000,
+    "commodity_type": "General Freight",
+    "num_of_pieces": 15,
+    "miles": 720,
+    "dimensions": "48x96x40"
+  }
+]
