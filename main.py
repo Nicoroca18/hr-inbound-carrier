@@ -312,7 +312,7 @@ def get_metrics():
 # Root & readiness
 @app.get("/")
 def root():
-    return {"message": "Inbound Carrier Agent PoC running"}
+    return {"message": "Inbound Carrier Agent PoC running - V3"}
 
 # -------------------------
 # Notes for next steps (not code):
