@@ -1,15 +1,25 @@
-# Python
+# === Secretos y entorno ===
+.env
+*.env
+.env.*
+
+# === Python ===
 __pycache__/
 *.pyc
 *.pyo
 *.pyd
-
-# Virtual environment
+*.egg-info/
+.venv/
 venv/
+.cache/
+.pytest_cache/
 
-# macOS
+# === Sistema/IDE ===
 .DS_Store
+.vscode/
+.idea/
 
-# Logs
+# === Logs/artefactos ===
 *.log
-
+dist/
+build/
