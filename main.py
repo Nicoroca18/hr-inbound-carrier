@@ -400,7 +400,7 @@ def dashboard_page():
     .controls button{padding:8px 12px;border:1px solid #111;border-radius:8px;background:#111;color:#fff;cursor:pointer}
     .quick{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
     .quick button{background:var(--indigo);border-color:var(--indigo);color:#fff;border:none;padding:8px 12px;border-radius:8px;cursor:pointer}
-    .row{display:grid;grid-template-columns: 2fr 1fr; gap:16px; align-items:start}
+    .row{display:grid;grid-template-columns: 2fr 1fr; gap:16px; align-items:center}
     canvas{border:1px solid var(--line);border-radius:12px;max-width:100%;background:#fff}
     table{width:100%;border-collapse:collapse;margin-top:12px;background:#fff}
     th,td{border-bottom:1px solid var(--line);padding:10px 12px;text-align:left;font-size:14px}
@@ -613,10 +613,11 @@ def dashboard_page():
       if(n===0){ ctx.fillStyle='#6b7280'; ctx.fillText('No data for selected range', padL+10, padT+20); return; }
 
       // Barras finas y más bonitas
-      const groupGap = 24;                 // más espacio entre grupos
-      const groupW   = Math.max(18, plotW/n - groupGap);
+      const groupGap = 32;                 // más espacio entre grupos
+      const groupW   = Math.max(14, plotW/n - groupGap);
       const barGap   = 6;
-      const barW     = Math.max(6, (groupW - barGap)/2);  // barras más finas
+      const barW     = Math.max(4, (groupW - barGap)/2);  // barras más finas
+
 
       for(let i=0;i<n;i++){
         const x0=padL + i*(groupW+groupGap);
@@ -624,12 +625,16 @@ def dashboard_page():
         // accepted
         const hA=(acc[i]/maxY)*plotH, yA=padT+plotH-hA;
         ctx.fillStyle='#3b82f6';
-        ctx.fillRect(x0, yA, barW, hA);
+        ctx.beginPath();
+        ctx.roundRect(x0, yA, barW, hA, 3); // esquinas redondeadas
+        ctx.fill();
 
         // rejected
         const hR=(rej[i]/maxY)*plotH, yR=padT+plotH-hR;
         ctx.fillStyle='#ef4444';
-        ctx.fillRect(x0+barW+barGap, yR, barW, hR);
+        ctx.beginPath();
+        ctx.roundRect(x0+barW+barGap, yR, barW, hR, 3);
+        ctx.fill();
 
         // etiquetas X (rotación si hay muchas)
         ctx.fillStyle='#374151'; ctx.save(); ctx.translate(x0+groupW/2, padT+plotH+16);
