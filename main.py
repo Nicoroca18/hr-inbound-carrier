@@ -331,7 +331,7 @@ def _aggregate_by_day(calls: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         elif acc is False: bucket["rejected"] += 1
     return [{"date": d, **agg[d]} for d in sorted(agg.keys())]
 
-def _build_metrics_payload(filtered_calls: List[Dict[str, Any]]) -> Dict[str, Any]]:
+def _build_metrics_payload(filtered_calls: List[Dict[str, Any]]) -> Dict[str, Any]:
     # Totales en el rango
     total_accepted = sum(1 for r in filtered_calls if r.get("accepted") is True)
     total_rejected = sum(1 for r in filtered_calls if r.get("accepted") is False)
@@ -339,11 +339,16 @@ def _build_metrics_payload(filtered_calls: List[Dict[str, Any]]) -> Dict[str, An
 
     # Sumas de precios finales
     total_final_sum = sum((r.get("final_price") or 0) for r in filtered_calls if r.get("final_price") is not None)
-    accepted_final_sum = sum((r.get("final_price") or 0) for r in filtered_calls if r.get("accepted") is True and r.get("final_price") is not None)
+    accepted_final_sum = sum(
+        (r.get("final_price") or 0)
+        for r in filtered_calls
+        if r.get("accepted") is True and r.get("final_price") is not None
+    )
 
     # Board-match: final_price == board_rate y aceptado
     board_match_acc_count = sum(
-        1 for r in filtered_calls
+        1
+        for r in filtered_calls
         if r.get("accepted") is True
         and r.get("final_price") is not None
         and r.get("board_rate") is not None
@@ -364,6 +369,7 @@ def _build_metrics_payload(filtered_calls: List[Dict[str, Any]]) -> Dict[str, An
         "board_match_accepted_count": board_match_acc_count,
         "board_match_rate_percent": round(board_match_rate_pct, 1) if board_match_rate_pct is not None else None,
     }
+
 
 # -------------------------
 # Dashboard routes
