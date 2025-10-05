@@ -1,25 +1,20 @@
 """
-main.py - Inbound Carrier Agent API (FastAPI) - Realistic negotiation
+main.py - Inbound Carrier Agent API (FastAPI) - Realistic negotiation + Embedded Dashboard
 
 Endpoints:
 - POST /api/authenticate  -> { mc_number }           (FMCSA real / auto / mock)
 - GET  /api/loads         -> lista de cargas (data/loads.json)
 - POST /api/negotiate     -> { mc_number, load_id, offer } (negociación hasta 3 rondas)
 - POST /api/call/result   -> { transcript, mc_number?, load_id?, final_price?, accepted? }
-- GET  /api/metrics       -> métricas simples (PoC)
+- GET  /api/metrics       -> métricas (requiere x-api-key)
+- GET  /dashboard         -> HTML del dashboard (público si PUBLIC_DASHBOARD=true)
+- GET  /dashboard/data    -> datos JSON del dashboard (público si PUBLIC_DASHBOARD=true)
 
 Lógica de negociación (realista):
-- El broker publica un "board rate" (ej. 1500 USD).
+- El broker publica un "board rate".
 - El carrier suele pedir MÁS dinero.
-- La API acepta si la oferta del carrier es <= TECHO (por defecto board * (1 + MAX_OVER_PCT)).
-- Si la oferta supera el TECHO, devolvemos nuestra contraoferta (el TECHO) y negociamos hasta 3 rondas.
-
-Vars de entorno principales:
-- API_KEY            (requerida)
-- FMCSA_WEBKEY       (opcional si FMCSA_MODE=mock)
-- FMCSA_MODE         'real' | 'auto' | 'mock'  (recomendado: 'auto')
-- LOADS_FILE         ruta del loads.json (por defecto ./data/loads.json)
-- MAX_OVER_PCT       porcentaje máximo sobre el board rate (por defecto 0.10 -> 10%)
+- Acepta si la oferta <= TECHO (board * (1 + MAX_OVER_PCT), por defecto 10%).
+- Si la oferta supera el TECHO, contraoferta = TECHO; máx. 3 rondas.
 """
 
 import os
@@ -28,6 +23,7 @@ import json
 import time
 from typing import Optional, List, Dict, Any
 from fastapi import FastAPI, HTTPException, Header, Depends
+from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel
 import requests
 
@@ -40,13 +36,13 @@ FMCSA_WEBKEY = os.getenv("FMCSA_WEBKEY", "")
 FMCSA_MODE = os.getenv("FMCSA_MODE", "real").lower()  # 'real' | 'auto' | 'mock'
 
 LOADS_FILE = os.getenv("LOADS_FILE", "./data/loads.json")
-# Techo máximo que estás dispuesto a pagar por encima del board (p.ej. 10%):
-MAX_OVER_PCT = float(os.getenv("MAX_OVER_PCT", "0.10"))
+MAX_OVER_PCT = float(os.getenv("MAX_OVER_PCT", "0.10"))  # 10% por encima del board
+PUBLIC_DASHBOARD = os.getenv("PUBLIC_DASHBOARD", "false").lower() == "true"
 
 # -------------------------
 # App & memoria (PoC)
 # -------------------------
-app = FastAPI(title="HappyRobot - Inbound Carrier API (Realistic)")
+app = FastAPI(title="HappyRobot - Inbound Carrier API (Realistic + Dashboard)")
 
 # estado de negociaciones en memoria
 # key = f"{mc}:{load_id}" => { round:int, settled:bool, price:float, listed:float, ceiling:float, history:list }
@@ -91,15 +87,13 @@ class LoadOut(BaseModel):
 class NegotiateIn(BaseModel):
     mc_number: str
     load_id: str
-    # HappyRobot a veces envía strings: soportamos Any y lo convertimos robustamente
-    offer: Any
+    offer: Any  # acepta num o str; lo parseamos robusto
 
 class CallResultIn(BaseModel):
     transcript: str
     mc_number: Optional[str] = None
     load_id: Optional[str] = None
-    # también puede llegar como string
-    final_price: Optional[Any] = None
+    final_price: Optional[Any] = None  # num o str
     accepted: Optional[bool] = None
 
 # -------------------------
@@ -118,16 +112,10 @@ def load_loads() -> List[Dict[str, Any]]:
     with open(LOADS_FILE, "r", encoding="utf-8") as f:
         return json.load(f)
 
-# parsing robusto de importes
 _num_re = re.compile(r"(-?\d{1,7}(?:\.\d{1,2})?)")
 
 def parse_amount(value: Any) -> float:
-    """
-    Convierte a float de forma robusta:
-    - int/float => float
-    - str => quita $, comas, espacios y toma el primer número
-    - si no hay dígitos válidos => 422
-    """
+    """Convierte a float de forma robusta."""
     if isinstance(value, (int, float)):
         return float(value)
     if isinstance(value, str):
@@ -140,7 +128,6 @@ def parse_amount(value: Any) -> float:
                 pass
     raise HTTPException(status_code=422, detail="Invalid offer: must be a numeric amount")
 
-# extracción simple (para /api/call/result)
 price_re = re.compile(r"\b(?:\$)?\s*(\d{2,6}(?:\.\d{1,2})?)\b")
 mc_re = re.compile(r"\bMC(?:\s|#|:)?\s*(\d{4,10})\b", re.IGNORECASE)
 loadid_re = re.compile(r"\bL\d{3,}\b", re.IGNORECASE)
@@ -190,12 +177,10 @@ def _mock_snapshot(mc: str) -> Dict[str, Any]:
 
 def fmcs_lookup_by_mc(mc_number: str) -> Dict[str, Any]:
     mc = mc_number.strip()
-    # cache básico
     entry = _fmcsa_cache.get(mc)
     if entry and (time.time() - entry["ts"] < CACHE_TTL_SECONDS):
         return entry["data"]
 
-    # Modo MOCK directo
     if FMCSA_MODE == "mock" or not FMCSA_WEBKEY:
         data = _mock_snapshot(mc)
         _fmcsa_cache[mc] = {"ts": time.time(), "data": data}
@@ -203,7 +188,6 @@ def fmcs_lookup_by_mc(mc_number: str) -> Dict[str, Any]:
             metrics["fmcsa_mock_uses"] += 1
         return data
 
-    # Modo REAL (estricto): si falla, levantamos error
     if FMCSA_MODE == "real":
         try:
             metrics["fmcsa_real_calls"] += 1
@@ -221,7 +205,6 @@ def fmcs_lookup_by_mc(mc_number: str) -> Dict[str, Any]:
             metrics["fmcsa_real_errors"] += 1
             raise RuntimeError(f"FMCSA lookup failed: {str(e)}")
 
-    # Modo AUTO: intenta real, si falla, mock (degradado)
     if FMCSA_MODE == "auto":
         try:
             metrics["fmcsa_real_calls"] += 1
@@ -242,28 +225,19 @@ def fmcs_lookup_by_mc(mc_number: str) -> Dict[str, Any]:
             _fmcsa_cache[mc] = {"ts": time.time(), "data": data}
             return data
 
-    # fallback mock
     data = _mock_snapshot(mc)
     _fmcsa_cache[mc] = {"ts": time.time(), "data": data}
     return data
 
-# negociación (realista):
-# - ceiling = listed * (1 + MAX_OVER_PCT)
-# - Si offer <= ceiling => aceptamos (ideal si <= listed, pero también aceptamos <= ceiling)
-# - Si offer > ceiling y ronda < 3 => devolvemos contraoferta = ceiling (tu mejor número)
-# - Si ronda >= 3 => fin sin acuerdo
+# negociación (realista)
 def compute_counter_down(ceiling: float) -> float:
-    # Devolvemos directamente nuestro mejor número (ceiling)
     return round(ceiling, 2)
 
 # -------------------------
-# Rutas
+# Rutas API core
 # -------------------------
 @app.post("/api/authenticate", dependencies=[Depends(require_api_key)])
 def authenticate(carrier: CarrierIn):
-    """
-    Verifica el MC en FMCSA (real / auto / mock).
-    """
     metrics["calls_total"] += 1
     mc = carrier.mc_number.strip()
     try:
@@ -272,7 +246,6 @@ def authenticate(carrier: CarrierIn):
         metrics["auth_failures"] += 1
         raise HTTPException(status_code=502, detail=f"FMCSA lookup failed: {str(e)}")
 
-    # Lógica de elegibilidad básica
     allowed = False
     if isinstance(snapshot, dict):
         allow = snapshot.get("allowToOperate") or snapshot.get("allow_to_operate") or snapshot.get("allow")
@@ -280,7 +253,6 @@ def authenticate(carrier: CarrierIn):
         if allow in ("Y", "Yes", True, "yes", "y") and out not in ("Y", "Yes", True, "yes", "y"):
             allowed = True
         else:
-            # en mock permitimos continuidad
             if snapshot.get("source") == "mock":
                 allowed = True
 
@@ -304,7 +276,7 @@ def get_loads(origin: Optional[str] = None, destination: Optional[str] = None, m
 def negotiate(payload: NegotiateIn):
     """
     Negociación REALISTA:
-      - listed  = board rate publicado (lo que pagarías idealmente)
+      - listed  = board rate publicado
       - ceiling = listed * (1 + MAX_OVER_PCT)
       - Acepta si offer <= ceiling (mejor aún si <= listed)
       - Si offer > ceiling y round < 3 => contraoferta = ceiling
@@ -312,7 +284,6 @@ def negotiate(payload: NegotiateIn):
     """
     key = f"{payload.mc_number}:{payload.load_id}"
 
-    # localizar el load (normalizando)
     loads = load_loads()
     load = next((l for l in loads if str(l.get("load_id")).strip() == str(payload.load_id).strip()), None)
     if not load:
@@ -330,7 +301,6 @@ def negotiate(payload: NegotiateIn):
     offer = parse_amount(payload.offer)
     state["history"].append({"type": "offer", "value": offer, "ts": time.time()})
 
-    # aceptación si está por debajo o igual al techo
     if offer <= ceiling:
         state["settled"] = True
         state["price"] = offer
@@ -339,7 +309,6 @@ def negotiate(payload: NegotiateIn):
         metrics["negotiation_rounds_total"] += state["round"]
         return {"accepted": True, "price": offer, "round": state["round"], "listed": listed, "ceiling": ceiling}
 
-    # si superó el techo:
     if state["round"] >= 3:
         metrics["offers_rejected"] += 1
         metrics["negotiation_rounds_total"] += state["round"]
@@ -355,9 +324,6 @@ def negotiate(payload: NegotiateIn):
 
 @app.post("/api/call/result", dependencies=[Depends(require_api_key)])
 def call_result(payload: CallResultIn):
-    """
-    Guarda resumen final. Si final_price llega como string, lo intentamos parsear.
-    """
     ent = extract_entities_from_text(payload.transcript or "")
     sentiment = simple_sentiment(payload.transcript)
 
@@ -381,8 +347,10 @@ def call_result(payload: CallResultIn):
     call_results.append(record)
     return {"ok": True, "summary": record}
 
-@app.get("/api/metrics", dependencies=[Depends(require_api_key)])
-def get_metrics():
+# -------------------------
+# Métricas + Dashboard
+# -------------------------
+def build_metrics_payload() -> Dict[str, Any]:
     avg_rounds = None
     total = metrics["offers_accepted"] + metrics["offers_rejected"]
     if total > 0:
@@ -394,9 +362,119 @@ def get_metrics():
         "recent_calls": call_results[-10:]
     }
 
+@app.get("/api/metrics", dependencies=[Depends(require_api_key)])
+def get_metrics():
+    return build_metrics_payload()
+
+def _assert_public_dashboard():
+    if not PUBLIC_DASHBOARD:
+        raise HTTPException(status_code=403, detail="Public dashboard is disabled. Set PUBLIC_DASHBOARD=true to enable.")
+
+@app.get("/dashboard", response_class=HTMLResponse)
+def dashboard_page():
+    _assert_public_dashboard()
+    html = """
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>HR PoC Metrics</title>
+  <style>
+    body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;margin:24px;color:#111}
+    h1{margin:0 0 16px}
+    .kpis{display:flex;gap:16px;flex-wrap:wrap;margin-bottom:16px}
+    .card{border:1px solid #e5e7eb;border-radius:12px;padding:12px 16px;min-width:180px;box-shadow:0 1px 2px rgba(0,0,0,.04)}
+    .label{font-size:12px;color:#6b7280;text-transform:uppercase;letter-spacing:.04em}
+    .value{font-size:24px;font-weight:600}
+    table{width:100%;border-collapse:collapse;margin-top:12px}
+    th,td{border-bottom:1px solid #e5e7eb;padding:8px 10px;text-align:left;font-size:14px}
+    th{background:#f9fafb;color:#374151}
+    tr:hover{background:#f8fafc}
+    .ok{color:#16a34a;font-weight:600}
+    .bad{color:#dc2626;font-weight:600}
+    .muted{color:#6b7280}
+    .foot{margin-top:16px;color:#6b7280;font-size:12px}
+  </style>
+</head>
+<body>
+  <h1>HappyRobot – Inbound Carrier Metrics</h1>
+  <div class="kpis">
+    <div class="card"><div class="label">Calls total</div><div id="calls_total" class="value">–</div></div>
+    <div class="card"><div class="label">Accepted</div><div id="accepted" class="value">–</div></div>
+    <div class="card"><div class="label">Rejected</div><div id="rejected" class="value">–</div></div>
+    <div class="card"><div class="label">Avg rounds</div><div id="avg_rounds" class="value">–</div></div>
+  </div>
+
+  <h2>Recent calls</h2>
+  <table>
+    <thead>
+      <tr>
+        <th>Timestamp (UTC)</th>
+        <th>MC</th>
+        <th>Load</th>
+        <th>Final Price</th>
+        <th>Accepted</th>
+        <th>Sentiment</th>
+        <th class="muted">Extracted</th>
+      </tr>
+    </thead>
+    <tbody id="tbody"></tbody>
+  </table>
+
+  <div class="foot" id="foot">Auto-refreshing…</div>
+
+  <script>
+    async function loadData(){
+      const res = await fetch('/dashboard/data');
+      if(!res.ok){ throw new Error('Failed to fetch /dashboard/data: ' + res.status); }
+      const j = await res.json();
+
+      const m = j.metrics || {};
+      document.getElementById('calls_total').textContent = m.calls_total ?? 0;
+      document.getElementById('accepted').textContent   = m.offers_accepted ?? 0;
+      document.getElementById('rejected').textContent   = m.offers_rejected ?? 0;
+      document.getElementById('avg_rounds').textContent = (j.avg_negotiation_rounds ?? '–');
+
+      const tb = document.getElementById('tbody');
+      tb.innerHTML = '';
+      (j.recent_calls||[]).slice().reverse().forEach(r=>{
+        const tr = document.createElement('tr');
+        const acc = r.accepted === true ? '<span class="ok">Yes</span>' : (r.accepted === false ? '<span class="bad">No</span>' : '<span class="muted">–</span>');
+        const ent = r.entities ? `mc:${r.entities.mc_number ?? ''} price:${r.entities.price ?? ''} load:${r.entities.load_id ?? ''}` : '';
+        tr.innerHTML = `
+          <td>${r.ts ?? ''}</td>
+          <td>${r.mc_number ?? ''}</td>
+          <td>${r.load_id ?? ''}</td>
+          <td>${(r.final_price ?? '')}</td>
+          <td>${acc}</td>
+          <td>${r.sentiment ?? ''}</td>
+          <td class="muted">${ent}</td>
+        `;
+        tb.appendChild(tr);
+      });
+
+      document.getElementById('foot').textContent = 'Updated at ' + (new Date()).toLocaleTimeString();
+    }
+
+    loadData();
+    setInterval(loadData, 5000);
+  </script>
+</body>
+</html>
+    """
+    return HTMLResponse(html)
+
+@app.get("/dashboard/data", response_class=JSONResponse)
+def dashboard_data():
+    _assert_public_dashboard()
+    return JSONResponse(build_metrics_payload())
+
+# -------------------------
+# Root
+# -------------------------
 @app.get("/")
 def root():
-    return {"message": "Inbound Carrier Agent running - V7 (realistic negotiation)"}
-
+    return {"message": "Inbound Carrier Agent running - V8 (realistic + dashboard)"}
 
 
