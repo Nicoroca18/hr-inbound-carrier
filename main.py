@@ -1,58 +1,63 @@
 """
-main.py - PoC Inbound Carrier Agent API (FastAPI)
+main.py - Inbound Carrier Agent API (FastAPI) - V5 (production-ready FMCSA)
 
 Endpoints:
-- POST /api/authenticate        -> { mc_number }  (verifica FMCSA o mock)
+- POST /api/authenticate        -> { mc_number }  (verifica FMCSA real; mock opcional según modo)
 - GET  /api/loads               -> lista de cargas del fichero data/loads.json
 - POST /api/negotiate           -> { mc_number, load_id, offer } -> negociación (hasta 3 rondas)
 - POST /api/call/result         -> { transcript, mc_number, load_id, final_price?, accepted? }
-- GET  /api/metrics             -> JSON con métricas básicas del PoC
+- GET  /api/metrics             -> métricas simples del PoC
 
-Notas:
-- Cabecera requerida: x-api-key (configurar API_KEY en env)
-- Para FMCSA real: configurar FMCSA_WEBKEY en env.
-- Mock fallback: si no hay FMCSA_WEBKEY, devuelve simulación (útil en desarrollo).
+Seguridad:
+- Cabecera requerida: x-api-key (API_KEY por entorno)
+
+FMCSA:
+- FMCSA_WEBKEY obligatoria en modo "real".
+- FMCSA_MODE: "real" (default) | "auto" | "mock"
+  * real: solo llamadas reales; errores -> 502
+  * auto: intenta real; si 401/403/5xx/timeout -> MOCK (marcado degraded=True)
+  * mock: solo mock (dev)
 """
 
 import os
 import re
 import json
 import time
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Tuple
+
+import requests
 from fastapi import FastAPI, HTTPException, Header, Depends
 from pydantic import BaseModel
-import requests
 
 # -------------------------
-# Config (por entorno; nunca hardcodear secretos)
+# Config por entorno (NO hardcodear secretos)
 # -------------------------
-API_KEY = os.getenv("API_KEY")  # si no está, devolvemos 500 en require_api_key
-FMCSA_WEBKEY = os.getenv("FMCSA_WEBKEY")  # si no está, usamos MOCK
+API_KEY = os.getenv("API_KEY")
+FMCSA_WEBKEY = os.getenv("FMCSA_WEBKEY")  # requerida en modo real/auto para intentar real
+FMCSA_MODE = os.getenv("FMCSA_MODE", "real").strip().lower()  # real | auto | mock
 LOADS_FILE = os.getenv("LOADS_FILE", "./data/loads.json")
-MIN_ACCEPT_PCT = float(os.getenv("MIN_ACCEPT_PCT", "0.85"))  # aceptar >= 85% del rate
+MIN_ACCEPT_PCT = float(os.getenv("MIN_ACCEPT_PCT", "0.85"))
 
 # -------------------------
-# App & in-memory stores (PoC)
+# App & mem stores
 # -------------------------
-app = FastAPI(title="HappyRobot FDE - Inbound Carrier API PoC")
+app = FastAPI(title="HappyRobot FDE - Inbound Carrier API")
 
-# negotiation state: key = f"{mc}:{load_id}" => { round:int, settled:bool, price:float, listed:float, history:list }
 negotiations: Dict[str, Dict[str, Any]] = {}
-
-# store call results (PoC)
 call_results: List[Dict[str, Any]] = []
-
-# metrics (contadores simples)
 metrics = {
     "calls_total": 0,
     "auth_failures": 0,
     "offers_accepted": 0,
     "offers_rejected": 0,
     "negotiation_rounds_total": 0,
+    "fmcsa_real_calls": 0,
+    "fmcsa_real_errors": 0,
+    "fmcsa_mock_uses": 0,
 }
 
 # -------------------------
-# Models
+# Modelos
 # -------------------------
 class CarrierIn(BaseModel):
     mc_number: str
@@ -85,10 +90,9 @@ class CallResultIn(BaseModel):
     accepted: Optional[bool] = None
 
 # -------------------------
-# Seguridad: API key (header x-api-key)
+# Seguridad: API key
 # -------------------------
 def require_api_key(x_api_key: str = Header(..., alias="x-api-key")):
-    # Si el servidor no tiene API_KEY configurada, es una mala configuración
     if not API_KEY:
         raise HTTPException(status_code=500, detail="Server misconfigured: API_KEY not set")
     if x_api_key != API_KEY:
@@ -96,7 +100,7 @@ def require_api_key(x_api_key: str = Header(..., alias="x-api-key")):
     return True
 
 # -------------------------
-# Utilidades
+# Utilidades varias
 # -------------------------
 def load_loads() -> List[Dict[str, Any]]:
     if not os.path.exists(LOADS_FILE):
@@ -104,98 +108,171 @@ def load_loads() -> List[Dict[str, Any]]:
     with open(LOADS_FILE, "r", encoding="utf-8") as f:
         return json.load(f)
 
-# -------- FMCSA lookup (mock fallback + normalización de respuesta) --------
+# -------- FMCSA client robusto --------
 _fmcsa_cache: Dict[str, Dict[str, Any]] = {}
 CACHE_TTL_SECONDS = 24 * 3600
 
-def _normalize_fmcsa_snapshot(raw: Dict[str, Any], mc: str) -> Dict[str, Any]:
+def _looks_like_usdot(s: str) -> bool:
+    # heurística simple: USDOT o número de 5-8 dígitos muy típico
+    s2 = s.strip().upper().replace("USDOT", "").strip()
+    return s.upper().startswith("USDOT") or s2.isdigit()
+
+def _normalize_flags_to_YN(v, default="N") -> str:
+    if v is None:
+        return default
+    if isinstance(v, bool):
+        return "Y" if v else "N"
+    s = str(v).strip().lower()
+    if s in ("y", "yes", "true", "t", "1", "authorized", "active"):
+        return "Y"
+    return "N"
+
+def _pick_first_content(raw: Dict[str, Any]) -> Dict[str, Any]:
+    # algunos endpoints devuelven {"content": [ ... ]}
+    if isinstance(raw, dict) and "content" in raw and isinstance(raw["content"], list) and raw["content"]:
+        return raw["content"][0]
+    return raw
+
+def _normalize_fmcsa_snapshot(raw: Dict[str, Any], identifier: str, source_tag: str) -> Dict[str, Any]:
     """
-    Intenta normalizar distintos formatos posibles de la API FMCSA a un shape común:
+    Normaliza a shape común:
     {
-      "mcNumber": str,
+      "mcNumber": str|None,
+      "usdotNumber": str|None,
       "legalName": str|None,
       "allowToOperate": "Y"/"N",
       "outOfService": "Y"/"N",
-      "snapshotDate": ISO8601|None,
-      "source": "FMCSA"|"mock"
+      "snapshotDate": str|None,
+      "source": source_tag ("FMCSA"|"mock"),
+      "degraded": bool   # True si venimos de mock en modo auto
     }
     """
-    # paths típicos: algunos devuelven content/[], otros companySnapshot, etc.
-    def get_any(d: Any, keys: List[str]):
-        for k in keys:
-            if isinstance(d, dict) and k in d:
-                return d[k]
+    cand = _pick_first_content(raw)
+    def g(keys: List[str]):
+        if isinstance(cand, dict):
+            for k in keys:
+                if k in cand:
+                    return cand[k]
         return None
 
-    # si viene anidado, intenta descender
-    candidate = raw
-    # algunos retornan {"content":[{...}]} → toma primer elemento
-    if isinstance(candidate, dict) and "content" in candidate and isinstance(candidate["content"], list) and candidate["content"]:
-        candidate = candidate["content"][0]
-
-    mc_number = str(get_any(candidate, ["mcNumber", "mc", "MC"])) if isinstance(candidate, dict) else None
-    legal_name = get_any(candidate, ["legalName", "legal_name", "dbaName", "name"])
-    allow = get_any(candidate, ["allowToOperate", "allow_to_operate", "authorizedForProperty"])
-    outsvc = get_any(candidate, ["outOfService", "out_of_service", "outOfServiceDate"])
-    snap = get_any(candidate, ["snapshotDate", "snapshot_date", "lastUpdated"])
-
-    # Normaliza flags a "Y"/"N" en lo posible
-    def to_YN(v, default="N"):
-        if v is None:
-            return default
-        if isinstance(v, bool):
-            return "Y" if v else "N"
-        s = str(v).strip().lower()
-        if s in ("y", "yes", "true", "t", "1", "authorized", "active"):
-            return "Y"
-        return "N"
+    mc = g(["mcNumber", "mc", "MC"])
+    usdot = g(["usdotNumber", "usdot", "USDOT"])
+    legal = g(["legalName", "legal_name", "dbaName", "name"])
+    allow = g(["allowToOperate", "allow_to_operate", "authorizedForProperty"])
+    outsvc = g(["outOfService", "out_of_service", "outOfServiceIndicator"])
+    snap = g(["snapshotDate", "snapshot_date", "lastUpdated", "last_update_date"])
 
     normalized = {
-        "mcNumber": mc_number or mc,
-        "legalName": legal_name,
-        "allowToOperate": to_YN(allow, default="Y" if not FMCSA_WEBKEY else "N"),
-        "outOfService": to_YN(False if outsvc in (None, "", "None") else True) if isinstance(outsvc, str) and outsvc not in ("", "None") else to_YN("N"),
+        "mcNumber": str(mc) if mc else (identifier if not _looks_like_usdot(identifier) else None),
+        "usdotNumber": str(usdot) if usdot else (identifier.replace("USDOT","").strip() if _looks_like_usdot(identifier) else None),
+        "legalName": legal,
+        "allowToOperate": _normalize_flags_to_YN(allow, default="N"),
+        "outOfService": _normalize_flags_to_YN(outsvc, default="N"),
         "snapshotDate": snap,
-        "source": "FMCSA" if FMCSA_WEBKEY else "mock",
-        "raw": raw,  # opcional: útil para debug
+        "source": source_tag,
+        "degraded": False,
+        "raw": raw,  # opcional para debugging
     }
     return normalized
 
-def fmcs_lookup_by_mc(mc_number: str) -> Dict[str, Any]:
-    mc = mc_number.strip()
-    # cache simple
-    entry = _fmcsa_cache.get(mc)
-    if entry and (time.time() - entry["ts"] < CACHE_TTL_SECONDS):
-        return entry["data"]
+def _http_get_json(url: str, params: Dict[str, Any], timeout: float = 10.0) -> Dict[str, Any]:
+    r = requests.get(url, params=params, timeout=timeout)
+    r.raise_for_status()
+    return r.json()
 
+def _try_fmcsa_chain(identifier: str) -> Tuple[Dict[str, Any], str]:
+    """
+    Intenta varios endpoints FMCSA en cadena.
+    Retorna (json, "endpoint_name") o levanta excepción en último fallo.
+    """
+    base = "https://mobile.fmcsa.dot.gov/qc/services"
+    chain = []
+    if _looks_like_usdot(identifier):
+        # USDOT primero
+        usd = identifier.replace("USDOT", "").strip()
+        chain = [
+            (f"{base}/carriers", {"webKey": FMCSA_WEBKEY, "dot": usd}, "carriers?dot"),
+            (f"{base}/companySnapshot", {"webKey": FMCSA_WEBKEY, "usdot": usd}, "companySnapshot?usdot"),
+        ]
+    else:
+        # MC primero
+        mc = identifier.strip()
+        chain = [
+            (f"{base}/carriers", {"webKey": FMCSA_WEBKEY, "mc": mc}, "carriers?mc"),
+            (f"{base}/companySnapshot", {"webKey": FMCSA_WEBKEY, "mcNumber": mc}, "companySnapshot?mcNumber"),
+        ]
+    last_exc = None
+    for url, params, tag in chain:
+        try:
+            data = _http_get_json(url, params)
+            return data, tag
+        except Exception as e:
+            last_exc = e
+    raise RuntimeError(f"FMCSA chain failed: {last_exc}")
+
+def _mock_snapshot(identifier: str) -> Dict[str, Any]:
+    return {
+        "mcNumber": None if _looks_like_usdot(identifier) else identifier.strip(),
+        "usdotNumber": identifier.replace("USDOT", "").strip() if _looks_like_usdot(identifier) else None,
+        "legalName": f"Mock Carrier {identifier.strip()}",
+        "allowToOperate": "Y",
+        "outOfService": "N",
+        "snapshotDate": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "source": "mock",
+        "degraded": True,  # en modo auto lo marcamos como degradado
+    }
+
+def fmcs_lookup(identifier: str) -> Dict[str, Any]:
+    """
+    Lookup robusto según FMCSA_MODE.
+    - real: intenta cadena real; si falla => 502
+    - auto: intenta cadena real; si falla => MOCK (degraded=True)
+    - mock: mock directo
+    Cache simple 24h por identifier.
+    """
+    key = identifier.strip().upper()
+    cached = _fmcsa_cache.get(key)
+    if cached and (time.time() - cached["ts"] < CACHE_TTL_SECONDS):
+        return cached["data"]
+
+    mode = FMCSA_MODE
+    if mode not in ("real", "auto", "mock"):
+        mode = "real"
+
+    if mode == "mock":
+        metrics["fmcsa_mock_uses"] += 1
+        data = _mock_snapshot(identifier)
+        _fmcsa_cache[key] = {"ts": time.time(), "data": data}
+        return data
+
+    # real / auto
     if not FMCSA_WEBKEY:
-        # MOCK response para desarrollo/demo
-        mock = {
-            "mcNumber": mc,
-            "legalName": f"Mock Carrier {mc}",
-            "allowToOperate": "Y",
-            "outOfService": "N",
-            "snapshotDate": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-            "source": "mock",
-        }
-        _fmcsa_cache[mc] = {"ts": time.time(), "data": mock}
-        return mock
+        if mode == "real":
+            metrics["fmcsa_real_errors"] += 1
+            raise RuntimeError("FMCSA_WEBKEY not set, required in 'real' mode")
+        # auto sin webkey -> mock
+        metrics["fmcsa_mock_uses"] += 1
+        data = _mock_snapshot(identifier)
+        _fmcsa_cache[key] = {"ts": time.time(), "data": data}
+        return data
 
-    # Lookup real: mantén este endpoint si te funciona; si la doc cambia, ajusta query/parseo
     try:
-        base = "https://mobile.fmcsa.dot.gov/qc/services"
-        url = f"{base}/companySnapshot"
-        params = {"webKey": FMCSA_WEBKEY, "mcNumber": mc}
-        r = requests.get(url, params=params, timeout=10)
-        r.raise_for_status()
-        data = r.json()
-        normalized = _normalize_fmcsa_snapshot(data, mc)
-        _fmcsa_cache[mc] = {"ts": time.time(), "data": normalized}
+        metrics["fmcsa_real_calls"] += 1
+        raw, tag = _try_fmcsa_chain(identifier)
+        normalized = _normalize_fmcsa_snapshot(raw, identifier, "FMCSA")
+        _fmcsa_cache[key] = {"ts": time.time(), "data": normalized}
         return normalized
     except Exception as e:
-        raise RuntimeError(f"FMCSA lookup failed: {e}")
+        metrics["fmcsa_real_errors"] += 1
+        if mode == "auto":
+            # Degradar a mock, pero marcado
+            data = _mock_snapshot(identifier)
+            _fmcsa_cache[key] = {"ts": time.time(), "data": data}
+            return data
+        # real estricto -> error
+        raise RuntimeError(str(e))
 
-# -------- Extracción simple & sentimiento (PoC) --------
+# -------- Extracción & Sentiment (PoC) --------
 price_re = re.compile(r"\b(?:\$)?\s*(\d{2,6}(?:\.\d{1,2})?)\b")
 mc_re = re.compile(r"\bMC(?:\s|#|:)?\s*(\d{4,10})\b", re.IGNORECASE)
 loadid_re = re.compile(r"\bL\d{3,}\b", re.IGNORECASE)
@@ -233,12 +310,10 @@ def simple_sentiment(text: str) -> str:
 
 # -------- Política de negociación --------
 def compute_counter(listed: float, offer: float, round_idx: int) -> float:
-    # Ronda 0: punto medio; luego concesión decreciente
     if round_idx == 0:
         return round((listed + offer) / 2, 2)
     concession = (listed - offer) * (0.5 * (0.7 ** (round_idx - 1)))
-    counter = round(listed - concession, 2)
-    return counter
+    return round(listed - concession, 2)
 
 # -------------------------
 # Rutas
@@ -246,22 +321,23 @@ def compute_counter(listed: float, offer: float, round_idx: int) -> float:
 @app.post("/api/authenticate", dependencies=[Depends(require_api_key)])
 def authenticate(carrier: CarrierIn):
     """
-    Verifica carrier via FMCSA (real si hay FMCSA_WEBKEY, mock si no).
+    Verifica carrier via FMCSA (real/auto/mock según FMCSA_MODE).
+    Elegibilidad: allowToOperate == "Y" y outOfService != "Y".
+    En modo auto, si se degrada a mock, el snapshot tendrá degraded=True.
     """
     metrics["calls_total"] += 1
-    mc = carrier.mc_number.strip()
+    identifier = carrier.mc_number.strip()
     try:
-        snapshot = fmcs_lookup_by_mc(mc)
+        snapshot = fmcs_lookup(identifier)
     except Exception as e:
         metrics["auth_failures"] += 1
         raise HTTPException(status_code=502, detail=f"FMCSA lookup failed: {e}")
 
-    # Elegibilidad básica con los campos normalizados
     allow = str(snapshot.get("allowToOperate", "N")).upper()
     outsvc = str(snapshot.get("outOfService", "N")).upper()
     allowed = (allow == "Y") and (outsvc != "Y")
 
-    # En mock, sé permisivo si falta algo
+    # En mock (o auto degradado), permitimos pasar para la demo/PoC
     if snapshot.get("source") == "mock":
         allowed = True
 
@@ -293,9 +369,9 @@ def negotiate(payload: NegotiateIn):
     Negociación:
       - Acepta si offer >= MIN_ACCEPT_PCT * listed_rate
       - Si no, devuelve counter_offer
-      - Máximo 3 rondas (round 0..3 -> al llegar a 3 sin aceptar, se corta)
+      - Máximo 3 rondas (0..3; al llegar a 3 sin aceptar, corta)
     """
-    key = f"{payload.mc_number.strip()}:{payload.load_id.strip()}"
+    key = f"{payload.mc_number.strip()}:{payload.load_id.strip().upper()}"
     loads = load_loads()
     load = next(
         (l for l in loads if str(l.get("load_id")).strip().upper() == str(payload.load_id).strip().upper()),
@@ -322,7 +398,6 @@ def negotiate(payload: NegotiateIn):
         metrics["negotiation_rounds_total"] += state["round"]
         return {"accepted": True, "price": offer, "round": state["round"]}
 
-    # Si ya estamos en 3 rondas sin aceptar, cortar
     if state["round"] >= 3:
         metrics["offers_rejected"] += 1
         metrics["negotiation_rounds_total"] += state["round"]
@@ -344,7 +419,6 @@ def call_result(payload: CallResultIn):
     ent = extract_entities_from_text(payload.transcript or "")
     sentiment = simple_sentiment(payload.transcript)
 
-    # Tolerar final_price como string numérica (si la plataforma la envía así)
     final_price_val: Optional[float] = payload.final_price
     if final_price_val is None and ent.get("price") is not None:
         try:
@@ -367,9 +441,6 @@ def call_result(payload: CallResultIn):
 
 @app.get("/api/metrics", dependencies=[Depends(require_api_key)])
 def get_metrics():
-    """
-    Devuelve métricas simples de PoC.
-    """
     total_outcomes = metrics["offers_accepted"] + metrics["offers_rejected"]
     avg_rounds = (metrics["negotiation_rounds_total"] / total_outcomes) if total_outcomes > 0 else None
     return {
@@ -379,9 +450,8 @@ def get_metrics():
         "recent_calls": call_results[-10:]
     }
 
-# Root & readiness
 @app.get("/")
 def root():
-    return {"message": "Inbound Carrier Agent PoC running - V4"}
+    return {"message": "Inbound Carrier Agent PoC running - V5"}
 
 
