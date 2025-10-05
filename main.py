@@ -449,10 +449,6 @@ def dashboard_page():
 
   <div class="row">
     <div>
-      <div class="legend">
-        <span><span class="swatch" style="background:#3b82f6"></span>Accepted</span>
-        <span><span class="swatch" style="background:#ef4444"></span>Rejected</span>
-      </div>
       <canvas id="chartBars" width="1100" height="360"></canvas>
     </div>
     <div>
@@ -587,7 +583,7 @@ def dashboard_page():
       const ctx = ctxBars;
       const W=ctx.canvas.width, H=ctx.canvas.height;
       ctx.clearRect(0,0,W,H);
-      const padL=60, padR=20, padT=20, padB=60;
+      const padL=60, padR=20, padT=40, padB=60;
       const plotW=W-padL-padR, plotH=H-padT-padB;
 
       const labels=rows.map(r=>r.date);
@@ -640,6 +636,29 @@ def dashboard_page():
         ctx.fillStyle='#374151'; ctx.save(); ctx.translate(x0+groupW/2, padT+plotH+16);
         if(n>10){ ctx.rotate(-Math.PI/6); }
         ctx.textAlign='center'; ctx.fillText(labels[i], 0, 0); ctx.restore();
+
+        // --- DIBUJAR LEYENDA DENTRO DEL CANVAS (arriba a la izquierda) ---
+        ctx.save();
+        ctx.font = '14px system-ui';
+        ctx.textAlign = 'left';
+        ctx.textBaseline = 'top';
+
+        const legendX = padL + 10;
+        const legendY = padT + 8;
+        const legendGap = 22;
+
+        ctx.fillStyle = '#3b82f6';
+        ctx.fillRect(legendX, legendY, 12, 12);
+        ctx.fillStyle = '#374151';
+        ctx.fillText('Accepted', legendX + 20, legendY - 1);
+
+        ctx.fillStyle = '#ef4444';
+        ctx.fillRect(legendX, legendY + legendGap, 12, 12);
+        ctx.fillStyle = '#374151';
+        ctx.fillText('Rejected', legendX + 20, legendY + legendGap - 1);
+
+        ctx.restore();
+
       }
     }
 
