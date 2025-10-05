@@ -1,16 +1,12 @@
 """
-main.py - Inbound Carrier Agent API (FastAPI)
-Realistic negotiation + Dashboard with grouped bar chart, date filters, quick ranges, acceptance rate KPI
-Frontend updates silently every 5 seconds (no "Loading" text shown)
+main.py - Inbound Carrier Agent API (Slim)
+- Endpoints usados por el workflow: /api/authenticate, /api/loads, /api/negotiate, /api/call/result
+- Dashboard: /dashboard (html) y /dashboard/data (json)
+- Refresh del dashboard silencioso (sin "Loading")
 
-Endpoints:
-- POST /api/authenticate
-- GET  /api/loads
-- POST /api/negotiate
-- POST /api/call/result
-- GET  /api/metrics                     (requires x-api-key)
-- GET  /dashboard                       (public if PUBLIC_DASHBOARD=true)
-- GET  /dashboard/data?from=YYYY-MM-DD&to=YYYY-MM-DD (public if PUBLIC_DASHBOARD=true)
+Notas:
+- FMCSA en modo "auto": si hay FMCSA_WEBKEY intenta real; si falla o no hay key, usa mock permisivo.
+- Negociación realista: el carrier pide MÁS que el board; aceptamos si <= techo (board * (1 + MAX_OVER_PCT)).
 """
 
 import os
@@ -18,10 +14,11 @@ import re
 import json
 import time
 from typing import Optional, List, Dict, Any, Tuple
+
+import requests
 from fastapi import FastAPI, HTTPException, Header, Depends, Query
 from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel
-import requests
 
 # -------------------------
 # Config
@@ -29,33 +26,36 @@ import requests
 API_KEY = os.getenv("API_KEY", "test-api-key")
 
 FMCSA_WEBKEY = os.getenv("FMCSA_WEBKEY", "")
-FMCSA_MODE = os.getenv("FMCSA_MODE", "real").lower()  # 'real' | 'auto' | 'mock'
+# En slim, usamos "auto" siempre (intenta real; si falla o no hay key, mock)
+FMCSA_BASE_URL = "https://mobile.fmcsa.dot.gov/qc/services/"
 
 LOADS_FILE = os.getenv("LOADS_FILE", "./data/loads.json")
-MAX_OVER_PCT = float(os.getenv("MAX_OVER_PCT", "0.10"))  # 10% over board rate
+MAX_OVER_PCT = float(os.getenv("MAX_OVER_PCT", "0.10"))  # techo = board * (1 + 10%)
 PUBLIC_DASHBOARD = os.getenv("PUBLIC_DASHBOARD", "false").lower() == "true"
 
-# -------------------------
-# App & memory (PoC)
-# -------------------------
-app = FastAPI(title="HappyRobot - Inbound Carrier API (Realistic + Dashboard)")
+# NLP de /api/call/result (extraer entidades y sentimiento del transcript) se puede desactivar:
+ENABLE_NLP = os.getenv("ENABLE_NLP", "true").lower() == "true"
 
-# in-memory stores
-negotiations: Dict[str, Dict[str, Any]] = {}  # key = f"{mc}:{load_id}"
+# -------------------------
+# App & Stores
+# -------------------------
+app = FastAPI(title="HappyRobot - Inbound Carrier API (Slim)")
+
+# Estado de negociación: key = f"{mc}:{load_id}"
+negotiations: Dict[str, Dict[str, Any]] = {}
+# Log de resultados de llamadas (para el dashboard)
 call_results: List[Dict[str, Any]] = []
+
+# Métricas mínimas (para KPIs y cálculo de avg rounds)
 metrics = {
     "calls_total": 0,
-    "auth_failures": 0,
     "offers_accepted": 0,
     "offers_rejected": 0,
     "negotiation_rounds_total": 0,
-    "fmcsa_real_calls": 0,
-    "fmcsa_real_errors": 0,
-    "fmcsa_mock_uses": 0,
 }
 
 # -------------------------
-# Models
+# Modelos
 # -------------------------
 class CarrierIn(BaseModel):
     mc_number: str
@@ -68,6 +68,7 @@ class LoadOut(BaseModel):
     delivery_datetime: str
     equipment_type: str
     loadboard_rate: float
+    # Campos extra opcionales soportados por tu loads.json
     notes: Optional[str] = None
     weight: Optional[float] = None
     commodity_type: Optional[str] = None
@@ -78,7 +79,7 @@ class LoadOut(BaseModel):
 class NegotiateIn(BaseModel):
     mc_number: str
     load_id: str
-    offer: Any  # may be number or string
+    offer: Any  # número o string (p.ej. "$1,600")
 
 class CallResultIn(BaseModel):
     transcript: str
@@ -88,14 +89,14 @@ class CallResultIn(BaseModel):
     accepted: Optional[bool] = None
 
 # -------------------------
-# Auth middleware
+# Auth simple por header
 # -------------------------
 def require_api_key(x_api_key: str = Header(...)):
     if x_api_key != API_KEY:
         raise HTTPException(status_code=401, detail="Invalid x-api-key")
 
 # -------------------------
-# Helpers
+# Utilidades
 # -------------------------
 def load_loads() -> List[Dict[str, Any]]:
     if not os.path.exists(LOADS_FILE):
@@ -106,52 +107,41 @@ def load_loads() -> List[Dict[str, Any]]:
 _num_re = re.compile(r"(-?\d{1,7}(?:\.\d{1,2})?)")
 
 def parse_amount(value: Any) -> float:
-    """Robust numeric parser for amounts."""
+    """Convierte oferta a float. Soporta '1600', '$1,600', '1600.00'."""
     if isinstance(value, (int, float)):
         return float(value)
     if isinstance(value, str):
         s = value.strip().replace(",", "").replace("$", "")
         m = _num_re.search(s)
         if m:
-            try:
-                return float(m.group(1))
-            except:
-                pass
+            return float(m.group(1))
     raise HTTPException(status_code=422, detail="Invalid offer: must be a numeric amount")
 
 price_re = re.compile(r"\b(?:\$)?\s*(\d{2,6}(?:\.\d{1,2})?)\b")
 mc_re = re.compile(r"\bMC(?:\s|#|:)?\s*(\d{4,10})\b", re.IGNORECASE)
 loadid_re = re.compile(r"\bL\d{3,}\b", re.IGNORECASE)
 
-def extract_entities_from_text(text: str) -> Dict[str, Optional[str]]:
-    text = text or ""
-    entities = {}
-    m_mc = mc_re.search(text)
-    if m_mc:
-        entities["mc_number"] = m_mc.group(1)
-    m_price = price_re.search(text.replace(",", ""))
-    if m_price:
-        entities["price"] = float(m_price.group(1))
-    m_load = loadid_re.search(text)
-    if m_load:
-        entities["load_id"] = m_load.group(0)
-    return entities
+def extract_entities_from_text(text: str) -> Dict[str, Any]:
+    if not ENABLE_NLP:
+        return {}
+    t = text or ""
+    out: Dict[str, Any] = {}
+    if (m := mc_re.search(t)): out["mc_number"] = m.group(1)
+    if (m := price_re.search(t.replace(",", ""))): out["price"] = float(m.group(1))
+    if (m := loadid_re.search(t)): out["load_id"] = m.group(0)
+    return out
 
 def simple_sentiment(text: str) -> str:
+    if not ENABLE_NLP:
+        return "neutral"
     if not text:
         return "neutral"
     t = text.lower()
-    positive_tokens = ["good", "great", "ok", "thanks", "thank", "yes", "happy", "accept"]
-    negative_tokens = ["no", "not", "reject", "angry", "bad", "hate", "problem", "can't", "cannot"]
-    pos = sum(t.count(tok) for tok in positive_tokens)
-    neg = sum(t.count(tok) for tok in negative_tokens)
-    if pos > neg:
-        return "positive"
-    if neg > pos:
-        return "negative"
-    return "neutral"
+    pos = sum(t.count(tok) for tok in ["good", "great", "ok", "thanks", "thank", "yes", "happy", "accept"])
+    neg = sum(t.count(tok) for tok in ["no", "not", "reject", "angry", "bad", "hate", "problem", "can't", "cannot"])
+    return "positive" if pos > neg else ("negative" if neg > pos else "neutral")
 
-# FMCSA with cache + auto fallback
+# FMCSA auto: intenta real; si falla o no hay key, mock permisivo
 _fmcsa_cache: Dict[str, Dict[str, Any]] = {}
 CACHE_TTL_SECONDS = 24 * 3600
 
@@ -162,8 +152,7 @@ def _mock_snapshot(mc: str) -> Dict[str, Any]:
         "allowToOperate": "Y",
         "outOfService": "N",
         "snapshotDate": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        "source": "mock",
-        "degraded": (FMCSA_MODE == "auto"),
+        "source": "mock"
     }
 
 def fmcs_lookup_by_mc(mc_number: str) -> Dict[str, Any]:
@@ -172,93 +161,55 @@ def fmcs_lookup_by_mc(mc_number: str) -> Dict[str, Any]:
     if entry and (time.time() - entry["ts"] < CACHE_TTL_SECONDS):
         return entry["data"]
 
-    if FMCSA_MODE == "mock" or not FMCSA_WEBKEY:
+    # Si no hay key o falla el real → mock
+    if not FMCSA_WEBKEY:
         data = _mock_snapshot(mc)
         _fmcsa_cache[mc] = {"ts": time.time(), "data": data}
-        if FMCSA_MODE != "mock":
-            metrics["fmcsa_mock_uses"] += 1
         return data
 
-    if FMCSA_MODE == "real":
-        try:
-            metrics["fmcsa_real_calls"] += 1
-            base = "https://mobile.fmcsa.dot.gov/qc/services/"
-            url = f"{base}companySnapshot?webKey={FMCSA_WEBKEY}&mcNumber={mc}"
-            r = requests.get(url, timeout=8)
-            r.raise_for_status()
-            data = r.json()
-            if isinstance(data, dict):
-                data.setdefault("source", "FMCSA")
-                data.setdefault("degraded", False)
-            _fmcsa_cache[mc] = {"ts": time.time(), "data": data}
-            return data
-        except Exception as e:
-            metrics["fmcsa_real_errors"] += 1
-            raise RuntimeError(f"FMCSA lookup failed: {str(e)}")
-
-    if FMCSA_MODE == "auto":
-        try:
-            metrics["fmcsa_real_calls"] += 1
-            base = "https://mobile.fmcsa.dot.gov/qc/services/"
-            url = f"{base}companySnapshot?webKey={FMCSA_WEBKEY}&mcNumber={mc}"
-            r = requests.get(url, timeout=8)
-            r.raise_for_status()
-            data = r.json()
-            if isinstance(data, dict):
-                data.setdefault("source", "FMCSA")
-                data.setdefault("degraded", False)
-            _fmcsa_cache[mc] = {"ts": time.time(), "data": data}
-            return data
-        except Exception as e:
-            metrics["fmcsa_real_errors"] += 1
+    try:
+        url = f"{FMCSA_BASE_URL}companySnapshot?webKey={FMCSA_WEBKEY}&mcNumber={mc}"
+        r = requests.get(url, timeout=8)
+        r.raise_for_status()
+        data = r.json()
+        if isinstance(data, dict):
+            data.setdefault("source", "FMCSA")
+        else:
             data = _mock_snapshot(mc)
-            metrics["fmcsa_mock_uses"] += 1
-            _fmcsa_cache[mc] = {"ts": time.time(), "data": data}
-            return data
+    except Exception:
+        data = _mock_snapshot(mc)
 
-    data = _mock_snapshot(mc)
     _fmcsa_cache[mc] = {"ts": time.time(), "data": data}
     return data
 
-# realistic negotiation
-def compute_counter_down(ceiling: float) -> float:
-    return round(ceiling, 2)
-
 # -------------------------
-# Core API routes
+# Rutas API
 # -------------------------
 @app.post("/api/authenticate", dependencies=[Depends(require_api_key)])
 def authenticate(carrier: CarrierIn):
     metrics["calls_total"] += 1
-    mc = carrier.mc_number.strip()
-    try:
-        snapshot = fmcs_lookup_by_mc(mc)
-    except Exception as e:
-        metrics["auth_failures"] += 1
-        raise HTTPException(status_code=502, detail=f"FMCSA lookup failed: {str(e)}")
-
-    allowed = False
+    snapshot = fmcs_lookup_by_mc(carrier.mc_number)
+    allowed = True
     if isinstance(snapshot, dict):
-        allow = snapshot.get("allowToOperate") or snapshot.get("allow_to_operate") or snapshot.get("allow")
-        out = snapshot.get("outOfService") or snapshot.get("out_of_service")
-        if allow in ("Y", "Yes", True, "yes", "y") and out not in ("Y", "Yes", True, "yes", "y"):
-            allowed = True
-        else:
-            if snapshot.get("source") == "mock":
-                allowed = True
-
+        allow = snapshot.get("allowToOperate")
+        out = snapshot.get("outOfService")
+        # Si FMCSA real devolviera denegado, respétalo; en mock dejamos pasar
+        if snapshot.get("source") != "mock":
+            if str(allow).lower() not in ("y", "yes", "true") or str(out).lower() in ("y", "yes", "true"):
+                allowed = False
     return {"eligible": allowed, "carrier": snapshot}
 
 @app.get("/api/loads", response_model=List[LoadOut], dependencies=[Depends(require_api_key)])
-def get_loads(origin: Optional[str] = None, destination: Optional[str] = None, max_miles: Optional[float] = None):
+def get_loads(
+    origin: Optional[str] = None,
+    destination: Optional[str] = None,
+    max_miles: Optional[float] = None
+):
     loads = load_loads()
     def match(l):
-        if origin and origin.lower() not in l.get("origin", "").lower():
-            return False
-        if destination and destination.lower() not in l.get("destination", "").lower():
-            return False
-        if max_miles and l.get("miles") and float(l.get("miles")) > float(max_miles):
-            return False
+        if origin and origin.lower() not in l.get("origin", "").lower(): return False
+        if destination and destination.lower() not in l.get("destination", "").lower(): return False
+        if max_miles and l.get("miles") and float(l.get("miles")) > float(max_miles): return False
         return True
     filtered = [l for l in loads if match(l)]
     return filtered[:10]
@@ -266,12 +217,12 @@ def get_loads(origin: Optional[str] = None, destination: Optional[str] = None, m
 @app.post("/api/negotiate", dependencies=[Depends(require_api_key)])
 def negotiate(payload: NegotiateIn):
     """
-    Realistic negotiation:
-      - listed  = board rate
-      - ceiling = listed * (1 + MAX_OVER_PCT)
-      - Accept if offer <= ceiling (ideally <= listed)
-      - If offer > ceiling and round < 3 => counter = ceiling
-      - If round >= 3 => no agreement
+    Lógica realista:
+    - listed = board rate (lo que publicas)
+    - ceiling = listed * (1 + MAX_OVER_PCT)
+    - El carrier pide MÁS que el board; aceptamos si su oferta <= ceiling.
+    - Si oferta > ceiling y aún hay rondas, nuestra contra es 'ceiling'.
+    - Máx 3 rondas; si no hay acuerdo, rechazamos.
     """
     key = f"{payload.mc_number}:{payload.load_id}"
 
@@ -283,21 +234,21 @@ def negotiate(payload: NegotiateIn):
     listed = float(load.get("loadboard_rate", 0))
     ceiling = round(listed * (1.0 + MAX_OVER_PCT), 2)
 
-    state = negotiations.get(key, {"round": 0, "settled": False, "listed": listed, "ceiling": ceiling, "history": []})
+    state = negotiations.get(key, {"round": 0, "settled": False})
     if state["settled"]:
         return {"accepted": True, "price": state.get("price"), "rounds": state["round"], "note": "already settled"}
 
     offer = parse_amount(payload.offer)
-    state["history"].append({"type": "offer", "value": offer, "ts": time.time()})
 
+    # Aceptamos si el carrier pide <= techo
     if offer <= ceiling:
-        state["settled"] = True
-        state["price"] = offer
+        state.update({"settled": True, "price": offer})
         negotiations[key] = state
         metrics["offers_accepted"] += 1
         metrics["negotiation_rounds_total"] += state["round"]
         return {"accepted": True, "price": offer, "round": state["round"], "listed": listed, "ceiling": ceiling}
 
+    # Rondas agotadas
     if state["round"] >= 3:
         metrics["offers_rejected"] += 1
         metrics["negotiation_rounds_total"] += state["round"]
@@ -305,17 +256,21 @@ def negotiate(payload: NegotiateIn):
         negotiations[key] = state
         return {"accepted": False, "reason": "max rounds reached", "round": state["round"], "listed": listed, "ceiling": ceiling}
 
-    counter = compute_counter_down(ceiling)
+    # Contra: techo
     state["round"] += 1
-    state["history"].append({"type": "counter", "value": counter, "ts": time.time()})
     negotiations[key] = state
-    return {"accepted": False, "counter_offer": counter, "round": state["round"], "listed": listed, "ceiling": ceiling}
+    return {"accepted": False, "counter_offer": ceiling, "round": state["round"], "listed": listed, "ceiling": ceiling}
 
 @app.post("/api/call/result", dependencies=[Depends(require_api_key)])
 def call_result(payload: CallResultIn):
-    ent = extract_entities_from_text(payload.transcript or "")
-    sentiment = simple_sentiment(payload.transcript)
+    """
+    Registra el resultado de la llamada (para dashboard y auditoría ligera).
+    Si ENABLE_NLP=true, intenta extraer MC/price/load_id del transcript y calcula sentimiento simple.
+    """
+    entities = extract_entities_from_text(payload.transcript or "")
+    sentiment = simple_sentiment(payload.transcript or "")
 
+    # Normaliza final_price si viene como string/moneda
     final_price_val: Optional[float] = None
     if payload.final_price is not None:
         try:
@@ -325,80 +280,70 @@ def call_result(payload: CallResultIn):
 
     record = {
         "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        "mc_number": (payload.mc_number or ent.get("mc_number")),
-        "load_id": (payload.load_id or ent.get("load_id")),
-        "transcript": payload.transcript,
-        "entities": ent,
+        "mc_number": payload.mc_number or entities.get("mc_number"),
+        "load_id": payload.load_id or entities.get("load_id"),
         "final_price": final_price_val,
         "accepted": payload.accepted,
-        "sentiment": sentiment
+        "sentiment": sentiment,
+        "entities": entities,
+        "transcript": payload.transcript,
     }
     call_results.append(record)
     return {"ok": True, "summary": record}
 
 # -------------------------
-# Metrics + Dashboard
+# Dashboard helpers
 # -------------------------
-def build_metrics_payload(filtered_calls: List[Dict[str, Any]]) -> Dict[str, Any]:
-    avg_rounds = None
-    total = metrics["offers_accepted"] + metrics["offers_rejected"]
-    if total > 0:
-        avg_rounds = metrics["negotiation_rounds_total"] / total
-    return {
-        "metrics": metrics,
-        "avg_negotiation_rounds": avg_rounds,
-        "calls_logged": len(filtered_calls),
-        "recent_calls": filtered_calls[-10:],
-    }
-
 def _assert_public_dashboard():
     if not PUBLIC_DASHBOARD:
-        raise HTTPException(status_code=403, detail="Public dashboard is disabled. Set PUBLIC_DASHBOARD=true to enable.")
+        raise HTTPException(status_code=403, detail="Public dashboard is disabled. Set PUBLIC_DASHBOARD=true.")
 
 def _parse_range_params(from_str: Optional[str], to_str: Optional[str]) -> Tuple[Optional[str], Optional[str]]:
     def _valid(d: Optional[str]) -> Optional[str]:
-        if not d:
-            return None
-        if len(d) == 10 and d[4] == '-' and d[7] == '-':
-            return d
-        return None
+        if not d: return None
+        return d if len(d) == 10 and d[4] == '-' and d[7] == '-' else None
     return _valid(from_str), _valid(to_str)
 
 def _filter_calls_by_date(calls: List[Dict[str, Any]], from_date: Optional[str], to_date: Optional[str]) -> List[Dict[str, Any]]:
     out = []
     for r in calls:
-        ts = r.get("ts") or ""
-        day = ts[:10] if len(ts) >= 10 else None
-        if not day:
-            continue
-        if from_date and day < from_date:
-            continue
-        if to_date and day > to_date:
-            continue
+        day = (r.get("ts") or "")[:10]
+        if not day: continue
+        if from_date and day < from_date: continue
+        if to_date and day > to_date: continue
         out.append(r)
     return out
 
 def _aggregate_by_day(calls: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     agg: Dict[str, Dict[str, int]] = {}
     for r in calls:
-        ts = r.get("ts") or ""
-        day = ts[:10] if len(ts) >= 10 else None
-        if not day:
-            continue
-        bucket = agg.setdefault(day, {"accepted": 0, "rejected": 0, "total": 0})
+        day = (r.get("ts") or "")[:10]
+        if not day: continue
+        bucket = agg.setdefault(day, {"accepted": 0, "rejected": 0})
         acc = r.get("accepted")
-        if acc is True:
-            bucket["accepted"] += 1
-        elif acc is False:
-            bucket["rejected"] += 1
-        bucket["total"] += 1
-    days = sorted(agg.keys())
-    return [{"date": d, **agg[d]} for d in days]
+        if acc is True: bucket["accepted"] += 1
+        elif acc is False: bucket["rejected"] += 1
+    return [{"date": d, **agg[d]} for d in sorted(agg.keys())]
 
-@app.get("/api/metrics", dependencies=[Depends(require_api_key)])
-def get_metrics():
-    return build_metrics_payload(call_results)
+def _build_metrics_payload(filtered_calls: List[Dict[str, Any]]) -> Dict[str, Any]:
+    total_accepted = sum(1 for r in filtered_calls if r.get("accepted") is True)
+    total_rejected = sum(1 for r in filtered_calls if r.get("accepted") is False)
+    total = total_accepted + total_rejected
+    avg_rounds = (metrics["negotiation_rounds_total"] / total) if total > 0 else None
+    return {
+        "metrics": {
+            "calls_total": metrics["calls_total"],
+            "offers_accepted": metrics["offers_accepted"],
+            "offers_rejected": metrics["offers_rejected"],
+        },
+        "avg_negotiation_rounds": avg_rounds,
+        "calls_logged": len(filtered_calls),
+        "recent_calls": filtered_calls[-10:],
+    }
 
+# -------------------------
+# Dashboard routes
+# -------------------------
 @app.get("/dashboard", response_class=HTMLResponse)
 def dashboard_page():
     _assert_public_dashboard()
@@ -412,7 +357,6 @@ def dashboard_page():
   <style>
     body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;margin:24px;color:#111}
     h1{margin:0 0 16px}
-    .row{display:flex;gap:16px;flex-wrap:wrap;align-items:flex-end}
     .kpis{display:flex;gap:16px;flex-wrap:wrap;margin:16px 0}
     .card{border:1px solid #e5e7eb;border-radius:12px;padding:12px 16px;min-width:180px;box-shadow:0 1px 2px rgba(0,0,0,.04)}
     .label{font-size:12px;color:#6b7280;text-transform:uppercase;letter-spacing:.04em}
@@ -421,7 +365,7 @@ def dashboard_page():
     .controls input{padding:6px 8px;border:1px solid #e5e7eb;border-radius:8px}
     .controls button{padding:8px 12px;border:1px solid #111;border-radius:8px;background:#111;color:#fff;cursor:pointer}
     .quick{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
-    .quick button{background:#2563eb;border-color:#2563eb}
+    .quick button{background:#2563eb;border-color:#2563eb;color:#fff;border:none;padding:8px 12px;border-radius:8px;cursor:pointer}
     canvas{border:1px solid #e5e7eb;border-radius:12px;max-width:100%}
     table{width:100%;border-collapse:collapse;margin-top:12px}
     th,td{border-bottom:1px solid #e5e7eb;padding:8px 10px;text-align:left;font-size:14px}
@@ -430,9 +374,6 @@ def dashboard_page():
     .ok{color:#16a34a;font-weight:600}
     .bad{color:#dc2626;font-weight:600}
     .muted{color:#6b7280}
-    .legend{display:flex;gap:16px;align-items:center;margin:8px 0}
-    .swatch{display:inline-block;width:12px;height:12px;border-radius:2px;margin-right:6px;vertical-align:middle}
-    .foot{margin-top:16px;color:#6b7280;font-size:12px}
   </style>
 </head>
 <body>
@@ -440,11 +381,11 @@ def dashboard_page():
 
   <div class="controls">
     <div>
-      <div class="label">From (YYYY-MM-DD)</div>
+      <div class="label">From</div>
       <input id="from" type="date" />
     </div>
     <div>
-      <div class="label">To (YYYY-MM-DD)</div>
+      <div class="label">To</div>
       <input id="to" type="date" />
     </div>
     <button id="apply">Apply filters</button>
@@ -466,10 +407,6 @@ def dashboard_page():
     <div class="card"><div class="label">Avg rounds (global)</div><div id="avg_rounds" class="value">–</div></div>
   </div>
 
-  <div class="legend">
-    <span><span class="swatch" style="background:#3b82f6"></span>Accepted</span>
-    <span><span class="swatch" style="background:#ef4444"></span>Rejected</span>
-  </div>
   <canvas id="chart" width="1100" height="360"></canvas>
 
   <h2>Recent calls (in range)</h2>
@@ -488,29 +425,28 @@ def dashboard_page():
     <tbody id="tbody"></tbody>
   </table>
 
-  <div class="foot" id="foot">Auto-refreshing…</div>
-
   <script>
     const elFrom = document.getElementById('from');
-    const elTo = document.getElementById('to');
-    const elApply = document.getElementById('apply');
-    const elCalls = document.getElementById('calls_total');
-    const elAcc = document.getElementById('accepted');
-    const elRej = document.getElementById('rejected');
-    const elAccRate = document.getElementById('acc_rate');
-    const elAvg = document.getElementById('avg_rounds');
-    const elTbody = document.getElementById('tbody');
-    const elFoot = document.getElementById('foot');
+    const elTo   = document.getElementById('to');
+    const elApply= document.getElementById('apply');
+
+    const elCalls= document.getElementById('calls_total');
+    const elAcc  = document.getElementById('accepted');
+    const elRej  = document.getElementById('rejected');
+    const elRate = document.getElementById('acc_rate');
+    const elAvg  = document.getElementById('avg_rounds');
+    const elTbody= document.getElementById('tbody');
+
     const canvas = document.getElementById('chart');
     const ctx = canvas.getContext('2d');
 
     const btn7 = document.getElementById('q7');
-    const btn14 = document.getElementById('q14');
-    const btn30 = document.getElementById('q30');
-    const btnToday = document.getElementById('qToday');
-    const btnClear = document.getElementById('qClear');
+    const btn14= document.getElementById('q14');
+    const btn30= document.getElementById('q30');
+    const btnToday=document.getElementById('qToday');
+    const btnClear=document.getElementById('qClear');
 
-    let isLoading = false; // avoid overlapping refreshes
+    let isLoading = false; // evita solapes
 
     function fmtYmdUTC(d){
       const y = d.getUTCFullYear();
@@ -518,36 +454,28 @@ def dashboard_page():
       const day = String(d.getUTCDate()).padStart(2,'0');
       return `${y}-${m}-${day}`;
     }
-
     function setRangeDays(days){
       const now = new Date();
       const to = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()));
       const from = new Date(to);
       from.setUTCDate(to.getUTCDate() - (days-1));
       elFrom.value = fmtYmdUTC(from);
-      elTo.value = fmtYmdUTC(to);
+      elTo.value   = fmtYmdUTC(to);
       loadData();
     }
-
     function setToday(){
       const now = new Date();
       const d = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()));
       const ymd = fmtYmdUTC(d);
-      elFrom.value = ymd;
-      elTo.value = ymd;
+      elFrom.value = ymd; elTo.value = ymd;
       loadData();
     }
-
-    function clearFilters(){
-      elFrom.value = '';
-      elTo.value = '';
-      loadData();
-    }
+    function clearFilters(){ elFrom.value=''; elTo.value=''; loadData(); }
 
     function qs(){
       const p = new URLSearchParams();
       if (elFrom.value) p.set('from', elFrom.value);
-      if (elTo.value) p.set('to', elTo.value);
+      if (elTo.value)   p.set('to', elTo.value);
       const s = p.toString();
       return s ? ('?' + s) : '';
     }
@@ -555,47 +483,41 @@ def dashboard_page():
     async function loadData(){
       if (isLoading) return;
       isLoading = true;
-      const url = '/dashboard/data' + qs();
       try{
-        const res = await fetch(url);
+        const res = await fetch('/dashboard/data' + qs());
         if(!res.ok){ isLoading = false; return; }
         const j = await res.json();
 
         // KPIs
-        const callsInRange = j.calls_logged ?? 0;
-        const acceptedInRange = j.accepted_in_range ?? 0;
-        const rejectedInRange = j.rejected_in_range ?? 0;
-        elCalls.textContent = callsInRange;
-        elAcc.textContent   = acceptedInRange;
-        elRej.textContent   = rejectedInRange;
-
-        const rate = callsInRange > 0 ? ((acceptedInRange / callsInRange) * 100).toFixed(1) + '%' : '–';
-        elAccRate.textContent = rate;
-
+        const calls = j.calls_logged || 0;
+        const acc   = j.accepted_in_range || 0;
+        const rej   = j.rejected_in_range || 0;
+        elCalls.textContent = calls;
+        elAcc.textContent   = acc;
+        elRej.textContent   = rej;
+        elRate.textContent  = calls ? ((acc / calls) * 100).toFixed(1) + '%' : '–';
         elAvg.textContent   = (j.avg_negotiation_rounds ?? '–');
 
-        // Table
+        // Tabla
         elTbody.innerHTML = '';
         (j.recent_calls||[]).slice().reverse().forEach(r=>{
           const tr = document.createElement('tr');
-          const acc = r.accepted === true ? '<span class="ok">Yes</span>' : (r.accepted === false ? '<span class="bad">No</span>' : '<span class="muted">–</span>');
+          const accTxt = r.accepted === true ? 'Yes' : (r.accepted === false ? 'No' : '–');
           const ent = r.entities ? `mc:${r.entities.mc_number ?? ''} price:${r.entities.price ?? ''} load:${r.entities.load_id ?? ''}` : '';
           tr.innerHTML = `
             <td>${r.ts ?? ''}</td>
             <td>${r.mc_number ?? ''}</td>
             <td>${r.load_id ?? ''}</td>
-            <td>${(r.final_price ?? '')}</td>
-            <td>${acc}</td>
+            <td>${r.final_price ?? ''}</td>
+            <td>${accTxt}</td>
             <td>${r.sentiment ?? ''}</td>
             <td class="muted">${ent}</td>
           `;
           elTbody.appendChild(tr);
         });
 
+        // Gráfico (barras aceptadas/rechazadas por día)
         drawChart(j.daily_counts || []);
-        elFoot.textContent = 'Updated at ' + (new Date()).toLocaleTimeString();
-      } catch(e){
-        // silent
       } finally{
         isLoading = false;
       }
@@ -603,78 +525,50 @@ def dashboard_page():
 
     function drawChart(rows){
       ctx.clearRect(0, 0, canvas.width, canvas.height);
-      const W = canvas.width, H = canvas.height;
-      const padL = 60, padR = 20, padT = 20, padB = 60;
-      const plotW = W - padL - padR;
-      const plotH = H - padT - padB;
+      const W=canvas.width, H=canvas.height;
+      const padL=60, padR=20, padT=20, padB=60;
+      const plotW=W-padL-padR, plotH=H-padT-padB;
+      const labels=rows.map(r=>r.date);
+      const acc=rows.map(r=>r.accepted||0);
+      const rej=rows.map(r=>r.rejected||0);
+      const maxY=Math.max(1, ...acc, ...rej);
 
-      const labels = rows.map(r => r.date);
-      const acc = rows.map(r => r.accepted || 0);
-      const rej = rows.map(r => r.rejected || 0);
-      const maxY = Math.max(1, ...acc, ...rej);
+      // ejes
+      ctx.strokeStyle='#e5e7eb'; ctx.lineWidth=1;
+      ctx.beginPath(); ctx.moveTo(padL, padT); ctx.lineTo(padL, padT+plotH); ctx.lineTo(padL+plotW, padT+plotH); ctx.stroke();
 
-      // axes
-      ctx.strokeStyle = '#e5e7eb';
-      ctx.lineWidth = 1;
-      ctx.beginPath();
-      ctx.moveTo(padL, padT);
-      ctx.lineTo(padL, padT + plotH);
-      ctx.lineTo(padL + plotW, padT + plotH);
-      ctx.stroke();
-
-      // y ticks
-      ctx.fillStyle = '#6b7280';
-      ctx.font = '12px system-ui';
-      const ticks = 5;
+      // ticks Y
+      ctx.fillStyle='#6b7280'; ctx.font='12px system-ui';
+      const ticks=5;
       for(let i=0;i<=ticks;i++){
-        const yVal = Math.round(maxY * i / ticks);
-        const y = padT + plotH - (plotH * i / ticks);
-        ctx.fillText(String(yVal), padL - 30, y + 4);
-        ctx.strokeStyle = '#f3f4f6';
-        ctx.beginPath();
-        ctx.moveTo(padL, y);
-        ctx.lineTo(padL + plotW, y);
-        ctx.stroke();
+        const yVal=Math.round(maxY * i / ticks);
+        const y=padT + plotH - (plotH * i / ticks);
+        ctx.fillText(String(yVal), padL-30, y+4);
+        ctx.strokeStyle='#f3f4f6'; ctx.beginPath(); ctx.moveTo(padL, y); ctx.lineTo(padL+plotW, y); ctx.stroke();
       }
 
-      const n = labels.length;
-      if(n === 0){
-        ctx.fillStyle = '#6b7280';
-        ctx.fillText('No data for selected range', padL + 10, padT + 20);
-        return;
-      }
+      const n=labels.length;
+      if(n===0){ ctx.fillStyle='#6b7280'; ctx.fillText('No data for selected range', padL+10, padT+20); return; }
 
-      const groupGap = 16;
-      const barGap = 8;
-      const groupW = Math.max(12, plotW / n - groupGap);
-      const barW = Math.max(8, (groupW - barGap) / 2);
+      const groupGap=16, barGap=8;
+      const groupW=Math.max(12, plotW/n - groupGap);
+      const barW=Math.max(8, (groupW - barGap)/2);
 
       for(let i=0;i<n;i++){
-        const x0 = padL + i * (groupW + groupGap);
+        const x0=padL + i*(groupW+groupGap);
         // accepted
-        const hA = (acc[i] / maxY) * plotH;
-        const yA = padT + plotH - hA;
-        ctx.fillStyle = '#3b82f6';
-        ctx.fillRect(x0, yA, barW, hA);
-
+        const hA=(acc[i]/maxY)*plotH, yA=padT+plotH-hA;
+        ctx.fillStyle='#3b82f6'; ctx.fillRect(x0, yA, barW, hA);
         // rejected
-        const hR = (rej[i] / maxY) * plotH;
-        const yR = padT + plotH - hR;
-        ctx.fillStyle = '#ef4444';
-        ctx.fillRect(x0 + barW + barGap, yR, barW, hR);
-
-        // x labels
-        ctx.fillStyle = '#374151';
-        ctx.save();
-        ctx.translate(x0 + groupW/2, padT + plotH + 16);
-        if(n > 10){ ctx.rotate(-Math.PI/6); }
-        ctx.textAlign = 'center';
-        ctx.fillText(labels[i], 0, 0);
-        ctx.restore();
+        const hR=(rej[i]/maxY)*plotH, yR=padT+plotH-hR;
+        ctx.fillStyle='#ef4444'; ctx.fillRect(x0+barW+barGap, yR, barW, hR);
+        // etiquetas X
+        ctx.fillStyle='#374151'; ctx.save(); ctx.translate(x0+groupW/2, padT+plotH+16);
+        if(n>10){ ctx.rotate(-Math.PI/6); } ctx.textAlign='center'; ctx.fillText(labels[i], 0, 0); ctx.restore();
       }
     }
 
-    // Events
+    // Eventos
     elApply.addEventListener('click', loadData);
     btn7.addEventListener('click', () => setRangeDays(7));
     btn14.addEventListener('click', () => setRangeDays(14));
@@ -682,7 +576,7 @@ def dashboard_page():
     btnToday.addEventListener('click', setToday);
     btnClear.addEventListener('click', clearFilters);
 
-    // Initial load + silent auto-refresh
+    // Carga inicial + auto-refresh silencioso
     loadData();
     setInterval(loadData, 5000);
   </script>
@@ -703,7 +597,7 @@ def dashboard_data(
     acc = sum(1 for r in filtered if r.get("accepted") is True)
     rej = sum(1 for r in filtered if r.get("accepted") is False)
 
-    payload = build_metrics_payload(filtered)
+    payload = _build_metrics_payload(filtered)
     payload.update({
         "accepted_in_range": acc,
         "rejected_in_range": rej,
@@ -712,8 +606,8 @@ def dashboard_data(
     return JSONResponse(payload)
 
 # -------------------------
-# Root
+# Raíz (health)
 # -------------------------
 @app.get("/")
 def root():
-    return {"message": "Inbound Carrier Agent running - V13 (silent refresh, no Loading)"}
+    return {"message": "Inbound Carrier Agent running - V14 Slim"}
