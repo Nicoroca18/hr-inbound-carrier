@@ -1,5 +1,6 @@
 """
-main.py - Inbound Carrier Agent API (FastAPI) - Realistic negotiation + Dashboard with chart & date filters
+main.py - Inbound Carrier Agent API (FastAPI)
+Realistic negotiation + Dashboard with grouped bar chart, date filters, and quick-range buttons
 
 Endpoints:
 - POST /api/authenticate
@@ -8,13 +9,7 @@ Endpoints:
 - POST /api/call/result
 - GET  /api/metrics                     (requires x-api-key)
 - GET  /dashboard                       (public if PUBLIC_DASHBOARD=true)
-- GET  /dashboard/data?from=YYYY-MM-DD&to=YYYY-MM-DD   (public if PUBLIC_DASHBOARD=true)
-
-Dashboard features:
-- KPIs (calls total, accepted, rejected, avg rounds)
-- Recent calls table (last 10 in range)
-- Grouped bar chart per day: accepted vs. rejected
-- Date filters (from/to); auto-refresh every 5s with current filters
+- GET  /dashboard/data?from=YYYY-MM-DD&to=YYYY-MM-DD (public if PUBLIC_DASHBOARD=true)
 """
 
 import os
@@ -36,22 +31,17 @@ FMCSA_WEBKEY = os.getenv("FMCSA_WEBKEY", "")
 FMCSA_MODE = os.getenv("FMCSA_MODE", "real").lower()  # 'real' | 'auto' | 'mock'
 
 LOADS_FILE = os.getenv("LOADS_FILE", "./data/loads.json")
-MAX_OVER_PCT = float(os.getenv("MAX_OVER_PCT", "0.10"))  # 10% por encima del board
+MAX_OVER_PCT = float(os.getenv("MAX_OVER_PCT", "0.10"))  # 10% over board rate
 PUBLIC_DASHBOARD = os.getenv("PUBLIC_DASHBOARD", "false").lower() == "true"
 
 # -------------------------
-# App & memoria (PoC)
+# App & memory (PoC)
 # -------------------------
 app = FastAPI(title="HappyRobot - Inbound Carrier API (Realistic + Dashboard)")
 
-# estado de negociaciones en memoria
-# key = f"{mc}:{load_id}" => { round:int, settled:bool, price:float, listed:float, ceiling:float, history:list }
-negotiations: Dict[str, Dict[str, Any]] = {}
-
-# resultados de llamadas
+# in-memory stores
+negotiations: Dict[str, Dict[str, Any]] = {}  # key = f"{mc}:{load_id}"
 call_results: List[Dict[str, Any]] = []
-
-# métricas simples
 metrics = {
     "calls_total": 0,
     "auth_failures": 0,
@@ -64,7 +54,7 @@ metrics = {
 }
 
 # -------------------------
-# Modelos
+# Models
 # -------------------------
 class CarrierIn(BaseModel):
     mc_number: str
@@ -87,13 +77,13 @@ class LoadOut(BaseModel):
 class NegotiateIn(BaseModel):
     mc_number: str
     load_id: str
-    offer: Any  # acepta num o str; lo parseamos robusto
+    offer: Any  # may be number or string
 
 class CallResultIn(BaseModel):
     transcript: str
     mc_number: Optional[str] = None
     load_id: Optional[str] = None
-    final_price: Optional[Any] = None  # num o str
+    final_price: Optional[Any] = None
     accepted: Optional[bool] = None
 
 # -------------------------
@@ -104,7 +94,7 @@ def require_api_key(x_api_key: str = Header(...)):
         raise HTTPException(status_code=401, detail="Invalid x-api-key")
 
 # -------------------------
-# Helpers comunes
+# Helpers
 # -------------------------
 def load_loads() -> List[Dict[str, Any]]:
     if not os.path.exists(LOADS_FILE):
@@ -115,7 +105,7 @@ def load_loads() -> List[Dict[str, Any]]:
 _num_re = re.compile(r"(-?\d{1,7}(?:\.\d{1,2})?)")
 
 def parse_amount(value: Any) -> float:
-    """Convierte a float de forma robusta."""
+    """Robust numeric parser for amounts."""
     if isinstance(value, (int, float)):
         return float(value)
     if isinstance(value, str):
@@ -160,7 +150,7 @@ def simple_sentiment(text: str) -> str:
         return "negative"
     return "neutral"
 
-# FMCSA lookup (con cache + modo 'auto' resiliente)
+# FMCSA with cache + auto fallback
 _fmcsa_cache: Dict[str, Dict[str, Any]] = {}
 CACHE_TTL_SECONDS = 24 * 3600
 
@@ -229,12 +219,12 @@ def fmcs_lookup_by_mc(mc_number: str) -> Dict[str, Any]:
     _fmcsa_cache[mc] = {"ts": time.time(), "data": data}
     return data
 
-# negociación (realista)
+# realistic negotiation
 def compute_counter_down(ceiling: float) -> float:
     return round(ceiling, 2)
 
 # -------------------------
-# Rutas API core
+# Core API routes
 # -------------------------
 @app.post("/api/authenticate", dependencies=[Depends(require_api_key)])
 def authenticate(carrier: CarrierIn):
@@ -275,12 +265,12 @@ def get_loads(origin: Optional[str] = None, destination: Optional[str] = None, m
 @app.post("/api/negotiate", dependencies=[Depends(require_api_key)])
 def negotiate(payload: NegotiateIn):
     """
-    Negociación REALISTA:
-      - listed  = board rate publicado
+    Realistic negotiation:
+      - listed  = board rate
       - ceiling = listed * (1 + MAX_OVER_PCT)
-      - Acepta si offer <= ceiling (mejor aún si <= listed)
-      - Si offer > ceiling y round < 3 => contraoferta = ceiling
-      - Si round >= 3 => no acuerdo
+      - Accept if offer <= ceiling (ideally <= listed)
+      - If offer > ceiling and round < 3 => counter = ceiling
+      - If round >= 3 => no agreement
     """
     key = f"{payload.mc_number}:{payload.load_id}"
 
@@ -292,9 +282,7 @@ def negotiate(payload: NegotiateIn):
     listed = float(load.get("loadboard_rate", 0))
     ceiling = round(listed * (1.0 + MAX_OVER_PCT), 2)
 
-    state = negotiations.get(key, {
-        "round": 0, "settled": False, "listed": listed, "ceiling": ceiling, "history": []
-    })
+    state = negotiations.get(key, {"round": 0, "settled": False, "listed": listed, "ceiling": ceiling, "history": []})
     if state["settled"]:
         return {"accepted": True, "price": state.get("price"), "rounds": state["round"], "note": "already settled"}
 
@@ -348,17 +336,13 @@ def call_result(payload: CallResultIn):
     return {"ok": True, "summary": record}
 
 # -------------------------
-# Métricas + Dashboard
+# Metrics + Dashboard
 # -------------------------
 def build_metrics_payload(filtered_calls: List[Dict[str, Any]]) -> Dict[str, Any]:
-    # KPIs basados en ALL metrics + filtered_calls para recent/avg rounds
-    # (metrics globales mantienen counters de negociación)
-    # avg_rounds solo puede aproximarse con los counters globales
     avg_rounds = None
     total = metrics["offers_accepted"] + metrics["offers_rejected"]
     if total > 0:
         avg_rounds = metrics["negotiation_rounds_total"] / total
-
     return {
         "metrics": metrics,
         "avg_negotiation_rounds": avg_rounds,
@@ -371,7 +355,6 @@ def _assert_public_dashboard():
         raise HTTPException(status_code=403, detail="Public dashboard is disabled. Set PUBLIC_DASHBOARD=true to enable.")
 
 def _parse_range_params(from_str: Optional[str], to_str: Optional[str]) -> Tuple[Optional[str], Optional[str]]:
-    # Espera 'YYYY-MM-DD' o None. Devuelve tuplas (from_date, to_date) en mismo formato.
     def _valid(d: Optional[str]) -> Optional[str]:
         if not d:
             return None
@@ -381,7 +364,6 @@ def _parse_range_params(from_str: Optional[str], to_str: Optional[str]) -> Tuple
     return _valid(from_str), _valid(to_str)
 
 def _filter_calls_by_date(calls: List[Dict[str, Any]], from_date: Optional[str], to_date: Optional[str]) -> List[Dict[str, Any]]:
-    # ts en call_results es "YYYY-MM-DDTHH:MM:SSZ" -> día = ts[:10]
     out = []
     for r in calls:
         ts = r.get("ts") or ""
@@ -396,7 +378,6 @@ def _filter_calls_by_date(calls: List[Dict[str, Any]], from_date: Optional[str],
     return out
 
 def _aggregate_by_day(calls: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    # Devuelve lista ordenada [{date, accepted, rejected, total}]
     agg: Dict[str, Dict[str, int]] = {}
     for r in calls:
         ts = r.get("ts") or ""
@@ -409,23 +390,17 @@ def _aggregate_by_day(calls: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             bucket["accepted"] += 1
         elif acc is False:
             bucket["rejected"] += 1
-        else:
-            # llamadas sin accepted definido no cuentan en esas barras, pero sí en total
-            pass
         bucket["total"] += 1
-    # ordenar por fecha asc
     days = sorted(agg.keys())
     return [{"date": d, **agg[d]} for d in days]
 
 @app.get("/api/metrics", dependencies=[Depends(require_api_key)])
 def get_metrics():
-    # /api/metrics sigue mostrando métricas globales + últimas 10 (sin filtro)
     return build_metrics_payload(call_results)
 
 @app.get("/dashboard", response_class=HTMLResponse)
 def dashboard_page():
     _assert_public_dashboard()
-    # HTML con chart + filtros
     html = """
 <!doctype html>
 <html>
@@ -441,9 +416,11 @@ def dashboard_page():
     .card{border:1px solid #e5e7eb;border-radius:12px;padding:12px 16px;min-width:180px;box-shadow:0 1px 2px rgba(0,0,0,.04)}
     .label{font-size:12px;color:#6b7280;text-transform:uppercase;letter-spacing:.04em}
     .value{font-size:24px;font-weight:600}
-    .controls{display:flex;gap:12px;align-items:center;margin:8px 0 16px}
+    .controls{display:flex;gap:12px;align-items:center;margin:8px 0 16px;flex-wrap:wrap}
     .controls input{padding:6px 8px;border:1px solid #e5e7eb;border-radius:8px}
     .controls button{padding:8px 12px;border:1px solid #111;border-radius:8px;background:#111;color:#fff;cursor:pointer}
+    .quick{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+    .quick button{background:#2563eb;border-color:#2563eb}
     canvas{border:1px solid #e5e7eb;border-radius:12px;max-width:100%}
     table{width:100%;border-collapse:collapse;margin-top:12px}
     th,td{border-bottom:1px solid #e5e7eb;padding:8px 10px;text-align:left;font-size:14px}
@@ -471,6 +448,14 @@ def dashboard_page():
     </div>
     <button id="apply">Apply filters</button>
     <span class="muted" id="status"></span>
+    <div class="quick">
+      <span class="label" style="margin-left:12px">Quick ranges:</span>
+      <button id="q7">Last 7 days</button>
+      <button id="q14">Last 14 days</button>
+      <button id="q30">Last 30 days</button>
+      <button id="qToday">Today</button>
+      <button id="qClear">Clear</button>
+    </div>
   </div>
 
   <div class="kpis">
@@ -518,6 +503,45 @@ def dashboard_page():
     const canvas = document.getElementById('chart');
     const ctx = canvas.getContext('2d');
 
+    const btn7 = document.getElementById('q7');
+    const btn14 = document.getElementById('q14');
+    const btn30 = document.getElementById('q30');
+    const btnToday = document.getElementById('qToday');
+    const btnClear = document.getElementById('qClear');
+
+    function fmtYmdUTC(d){
+      const y = d.getUTCFullYear();
+      const m = String(d.getUTCMonth()+1).padStart(2,'0');
+      const day = String(d.getUTCDate()).padStart(2,'0');
+      return `${y}-${m}-${day}`;
+    }
+
+    function setRangeDays(days){
+      // days=7 -> from=today-6, to=today  (inclusive)
+      const now = new Date();
+      const to = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()));
+      const from = new Date(to);
+      from.setUTCDate(to.getUTCDate() - (days-1));
+      elFrom.value = fmtYmdUTC(from);
+      elTo.value = fmtYmdUTC(to);
+      loadData();
+    }
+
+    function setToday(){
+      const now = new Date();
+      const d = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()));
+      const ymd = fmtYmdUTC(d);
+      elFrom.value = ymd;
+      elTo.value = ymd;
+      loadData();
+    }
+
+    function clearFilters(){
+      elFrom.value = '';
+      elTo.value = '';
+      loadData();
+    }
+
     function qs(){
       const p = new URLSearchParams();
       if (elFrom.value) p.set('from', elFrom.value);
@@ -541,7 +565,7 @@ def dashboard_page():
       elRej.textContent   = j.rejected_in_range ?? 0;
       elAvg.textContent   = (j.avg_negotiation_rounds ?? '–');
 
-      // Tabla
+      // Table
       elTbody.innerHTML = '';
       (j.recent_calls||[]).slice().reverse().forEach(r=>{
         const tr = document.createElement('tr');
@@ -559,28 +583,23 @@ def dashboard_page():
         elTbody.appendChild(tr);
       });
 
-      // Chart (grouped bars)
       drawChart(j.daily_counts || []);
       elFoot.textContent = 'Updated at ' + (new Date()).toLocaleTimeString();
     }
 
     function drawChart(rows){
-      // Clear
       ctx.clearRect(0, 0, canvas.width, canvas.height);
-
-      // Padding and sizes
       const W = canvas.width, H = canvas.height;
       const padL = 60, padR = 20, padT = 20, padB = 60;
       const plotW = W - padL - padR;
       const plotH = H - padT - padB;
 
-      // Prepare data
       const labels = rows.map(r => r.date);
       const acc = rows.map(r => r.accepted || 0);
       const rej = rows.map(r => r.rejected || 0);
       const maxY = Math.max(1, ...acc, ...rej);
 
-      // Axes
+      // axes
       ctx.strokeStyle = '#e5e7eb';
       ctx.lineWidth = 1;
       ctx.beginPath();
@@ -589,7 +608,7 @@ def dashboard_page():
       ctx.lineTo(padL + plotW, padT + plotH);
       ctx.stroke();
 
-      // Y ticks (5)
+      // y ticks
       ctx.fillStyle = '#6b7280';
       ctx.font = '12px system-ui';
       const ticks = 5;
@@ -604,7 +623,6 @@ def dashboard_page():
         ctx.stroke();
       }
 
-      // Bars
       const n = labels.length;
       if(n === 0){
         ctx.fillStyle = '#6b7280';
@@ -612,7 +630,6 @@ def dashboard_page():
         return;
       }
 
-      // For each day: group width, two bars (accepted=blue, rejected=red)
       const groupGap = 16;
       const barGap = 8;
       const groupW = Math.max(12, plotW / n - groupGap);
@@ -620,18 +637,19 @@ def dashboard_page():
 
       for(let i=0;i<n;i++){
         const x0 = padL + i * (groupW + groupGap);
-        // accepted bar
+        // accepted
         const hA = (acc[i] / maxY) * plotH;
         const yA = padT + plotH - hA;
-        ctx.fillStyle = '#3b82f6'; // blue
+        ctx.fillStyle = '#3b82f6';
         ctx.fillRect(x0, yA, barW, hA);
-        // rejected bar
+
+        // rejected
         const hR = (rej[i] / maxY) * plotH;
         const yR = padT + plotH - hR;
-        ctx.fillStyle = '#ef4444'; // red
+        ctx.fillStyle = '#ef4444';
         ctx.fillRect(x0 + barW + barGap, yR, barW, hR);
 
-        // x labels (rotate a little if too many)
+        // x labels
         ctx.fillStyle = '#374151';
         ctx.save();
         ctx.translate(x0 + groupW/2, padT + plotH + 16);
@@ -644,6 +662,12 @@ def dashboard_page():
 
     // Events
     elApply.addEventListener('click', loadData);
+    btn7.addEventListener('click', () => setRangeDays(7));
+    btn14.addEventListener('click', () => setRangeDays(14));
+    btn30.addEventListener('click', () => setRangeDays(30));
+    btnToday.addEventListener('click', setToday);
+    btnClear.addEventListener('click', clearFilters);
+
     // Initial load + auto-refresh
     loadData();
     setInterval(loadData, 5000);
@@ -660,16 +684,12 @@ def dashboard_data(
 ):
     _assert_public_dashboard()
     f, t = _parse_range_params(from_date, to_date)
-    # filtrar
     filtered = _filter_calls_by_date(call_results, f, t)
-    # agregación diaria
     daily = _aggregate_by_day(filtered)
-    # contadores in-range
     acc = sum(1 for r in filtered if r.get("accepted") is True)
     rej = sum(1 for r in filtered if r.get("accepted") is False)
 
     payload = build_metrics_payload(filtered)
-    # añadimos campos específicos del dashboard dinámico
     payload.update({
         "accepted_in_range": acc,
         "rejected_in_range": rej,
@@ -682,5 +702,4 @@ def dashboard_data(
 # -------------------------
 @app.get("/")
 def root():
-    return {"message": "Inbound Carrier Agent running - V9 (dashboard + date filters)"}
-
+    return {"message": "Inbound Carrier Agent running - V10 (dashboard + quick ranges)"}
