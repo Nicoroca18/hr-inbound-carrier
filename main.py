@@ -1,28 +1,28 @@
 """
-main.py - Inbound Carrier Agent API (FastAPI) - Realistic negotiation + Embedded Dashboard
+main.py - Inbound Carrier Agent API (FastAPI) - Realistic negotiation + Dashboard with chart & date filters
 
 Endpoints:
-- POST /api/authenticate  -> { mc_number }           (FMCSA real / auto / mock)
-- GET  /api/loads         -> lista de cargas (data/loads.json)
-- POST /api/negotiate     -> { mc_number, load_id, offer } (negociación hasta 3 rondas)
-- POST /api/call/result   -> { transcript, mc_number?, load_id?, final_price?, accepted? }
-- GET  /api/metrics       -> métricas (requiere x-api-key)
-- GET  /dashboard         -> HTML del dashboard (público si PUBLIC_DASHBOARD=true)
-- GET  /dashboard/data    -> datos JSON del dashboard (público si PUBLIC_DASHBOARD=true)
+- POST /api/authenticate
+- GET  /api/loads
+- POST /api/negotiate
+- POST /api/call/result
+- GET  /api/metrics                     (requires x-api-key)
+- GET  /dashboard                       (public if PUBLIC_DASHBOARD=true)
+- GET  /dashboard/data?from=YYYY-MM-DD&to=YYYY-MM-DD   (public if PUBLIC_DASHBOARD=true)
 
-Lógica de negociación (realista):
-- El broker publica un "board rate".
-- El carrier suele pedir MÁS dinero.
-- Acepta si la oferta <= TECHO (board * (1 + MAX_OVER_PCT), por defecto 10%).
-- Si la oferta supera el TECHO, contraoferta = TECHO; máx. 3 rondas.
+Dashboard features:
+- KPIs (calls total, accepted, rejected, avg rounds)
+- Recent calls table (last 10 in range)
+- Grouped bar chart per day: accepted vs. rejected
+- Date filters (from/to); auto-refresh every 5s with current filters
 """
 
 import os
 import re
 import json
 import time
-from typing import Optional, List, Dict, Any
-from fastapi import FastAPI, HTTPException, Header, Depends
+from typing import Optional, List, Dict, Any, Tuple
+from fastapi import FastAPI, HTTPException, Header, Depends, Query
 from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel
 import requests
@@ -350,29 +350,82 @@ def call_result(payload: CallResultIn):
 # -------------------------
 # Métricas + Dashboard
 # -------------------------
-def build_metrics_payload() -> Dict[str, Any]:
+def build_metrics_payload(filtered_calls: List[Dict[str, Any]]) -> Dict[str, Any]:
+    # KPIs basados en ALL metrics + filtered_calls para recent/avg rounds
+    # (metrics globales mantienen counters de negociación)
+    # avg_rounds solo puede aproximarse con los counters globales
     avg_rounds = None
     total = metrics["offers_accepted"] + metrics["offers_rejected"]
     if total > 0:
         avg_rounds = metrics["negotiation_rounds_total"] / total
+
     return {
         "metrics": metrics,
         "avg_negotiation_rounds": avg_rounds,
-        "calls_logged": len(call_results),
-        "recent_calls": call_results[-10:]
+        "calls_logged": len(filtered_calls),
+        "recent_calls": filtered_calls[-10:],
     }
-
-@app.get("/api/metrics", dependencies=[Depends(require_api_key)])
-def get_metrics():
-    return build_metrics_payload()
 
 def _assert_public_dashboard():
     if not PUBLIC_DASHBOARD:
         raise HTTPException(status_code=403, detail="Public dashboard is disabled. Set PUBLIC_DASHBOARD=true to enable.")
 
+def _parse_range_params(from_str: Optional[str], to_str: Optional[str]) -> Tuple[Optional[str], Optional[str]]:
+    # Espera 'YYYY-MM-DD' o None. Devuelve tuplas (from_date, to_date) en mismo formato.
+    def _valid(d: Optional[str]) -> Optional[str]:
+        if not d:
+            return None
+        if len(d) == 10 and d[4] == '-' and d[7] == '-':
+            return d
+        return None
+    return _valid(from_str), _valid(to_str)
+
+def _filter_calls_by_date(calls: List[Dict[str, Any]], from_date: Optional[str], to_date: Optional[str]) -> List[Dict[str, Any]]:
+    # ts en call_results es "YYYY-MM-DDTHH:MM:SSZ" -> día = ts[:10]
+    out = []
+    for r in calls:
+        ts = r.get("ts") or ""
+        day = ts[:10] if len(ts) >= 10 else None
+        if not day:
+            continue
+        if from_date and day < from_date:
+            continue
+        if to_date and day > to_date:
+            continue
+        out.append(r)
+    return out
+
+def _aggregate_by_day(calls: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    # Devuelve lista ordenada [{date, accepted, rejected, total}]
+    agg: Dict[str, Dict[str, int]] = {}
+    for r in calls:
+        ts = r.get("ts") or ""
+        day = ts[:10] if len(ts) >= 10 else None
+        if not day:
+            continue
+        bucket = agg.setdefault(day, {"accepted": 0, "rejected": 0, "total": 0})
+        acc = r.get("accepted")
+        if acc is True:
+            bucket["accepted"] += 1
+        elif acc is False:
+            bucket["rejected"] += 1
+        else:
+            # llamadas sin accepted definido no cuentan en esas barras, pero sí en total
+            pass
+        bucket["total"] += 1
+    # ordenar por fecha asc
+    days = sorted(agg.keys())
+    return [{"date": d, **agg[d]} for d in days]
+
+@app.get("/api/metrics", dependencies=[Depends(require_api_key)])
+def get_metrics():
+    # /api/metrics sigue mostrando métricas globales + últimas 10 (sin filtro)
+    return build_metrics_payload(call_results)
+
 @app.get("/dashboard", response_class=HTMLResponse)
 def dashboard_page():
     _assert_public_dashboard()
+    # HTML con chart + filtros
     html = """
 <!doctype html>
 <html>
@@ -383,10 +436,15 @@ def dashboard_page():
   <style>
     body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;margin:24px;color:#111}
     h1{margin:0 0 16px}
-    .kpis{display:flex;gap:16px;flex-wrap:wrap;margin-bottom:16px}
+    .row{display:flex;gap:16px;flex-wrap:wrap;align-items:flex-end}
+    .kpis{display:flex;gap:16px;flex-wrap:wrap;margin:16px 0}
     .card{border:1px solid #e5e7eb;border-radius:12px;padding:12px 16px;min-width:180px;box-shadow:0 1px 2px rgba(0,0,0,.04)}
     .label{font-size:12px;color:#6b7280;text-transform:uppercase;letter-spacing:.04em}
     .value{font-size:24px;font-weight:600}
+    .controls{display:flex;gap:12px;align-items:center;margin:8px 0 16px}
+    .controls input{padding:6px 8px;border:1px solid #e5e7eb;border-radius:8px}
+    .controls button{padding:8px 12px;border:1px solid #111;border-radius:8px;background:#111;color:#fff;cursor:pointer}
+    canvas{border:1px solid #e5e7eb;border-radius:12px;max-width:100%}
     table{width:100%;border-collapse:collapse;margin-top:12px}
     th,td{border-bottom:1px solid #e5e7eb;padding:8px 10px;text-align:left;font-size:14px}
     th{background:#f9fafb;color:#374151}
@@ -394,19 +452,41 @@ def dashboard_page():
     .ok{color:#16a34a;font-weight:600}
     .bad{color:#dc2626;font-weight:600}
     .muted{color:#6b7280}
+    .legend{display:flex;gap:16px;align-items:center;margin:8px 0}
+    .swatch{display:inline-block;width:12px;height:12px;border-radius:2px;margin-right:6px;vertical-align:middle}
     .foot{margin-top:16px;color:#6b7280;font-size:12px}
   </style>
 </head>
 <body>
   <h1>HappyRobot – Inbound Carrier Metrics</h1>
-  <div class="kpis">
-    <div class="card"><div class="label">Calls total</div><div id="calls_total" class="value">–</div></div>
-    <div class="card"><div class="label">Accepted</div><div id="accepted" class="value">–</div></div>
-    <div class="card"><div class="label">Rejected</div><div id="rejected" class="value">–</div></div>
-    <div class="card"><div class="label">Avg rounds</div><div id="avg_rounds" class="value">–</div></div>
+
+  <div class="controls">
+    <div>
+      <div class="label">From (YYYY-MM-DD)</div>
+      <input id="from" type="date" />
+    </div>
+    <div>
+      <div class="label">To (YYYY-MM-DD)</div>
+      <input id="to" type="date" />
+    </div>
+    <button id="apply">Apply filters</button>
+    <span class="muted" id="status"></span>
   </div>
 
-  <h2>Recent calls</h2>
+  <div class="kpis">
+    <div class="card"><div class="label">Calls (in range)</div><div id="calls_total" class="value">–</div></div>
+    <div class="card"><div class="label">Accepted</div><div id="accepted" class="value">–</div></div>
+    <div class="card"><div class="label">Rejected</div><div id="rejected" class="value">–</div></div>
+    <div class="card"><div class="label">Avg rounds (global)</div><div id="avg_rounds" class="value">–</div></div>
+  </div>
+
+  <div class="legend">
+    <span><span class="swatch" style="background:#3b82f6"></span>Accepted</span>
+    <span><span class="swatch" style="background:#ef4444"></span>Rejected</span>
+  </div>
+  <canvas id="chart" width="1100" height="360"></canvas>
+
+  <h2>Recent calls (in range)</h2>
   <table>
     <thead>
       <tr>
@@ -425,19 +505,44 @@ def dashboard_page():
   <div class="foot" id="foot">Auto-refreshing…</div>
 
   <script>
+    const elFrom = document.getElementById('from');
+    const elTo = document.getElementById('to');
+    const elApply = document.getElementById('apply');
+    const elStatus = document.getElementById('status');
+    const elCalls = document.getElementById('calls_total');
+    const elAcc = document.getElementById('accepted');
+    const elRej = document.getElementById('rejected');
+    const elAvg = document.getElementById('avg_rounds');
+    const elTbody = document.getElementById('tbody');
+    const elFoot = document.getElementById('foot');
+    const canvas = document.getElementById('chart');
+    const ctx = canvas.getContext('2d');
+
+    function qs(){
+      const p = new URLSearchParams();
+      if (elFrom.value) p.set('from', elFrom.value);
+      if (elTo.value) p.set('to', elTo.value);
+      const s = p.toString();
+      return s ? ('?' + s) : '';
+    }
+
     async function loadData(){
-      const res = await fetch('/dashboard/data');
-      if(!res.ok){ throw new Error('Failed to fetch /dashboard/data: ' + res.status); }
+      const url = '/dashboard/data' + qs();
+      elStatus.textContent = 'Loading…';
+      const res = await fetch(url);
+      if(!res.ok){ elStatus.textContent = 'Error ' + res.status; return; }
       const j = await res.json();
+      elStatus.textContent = '';
 
+      // KPIs
       const m = j.metrics || {};
-      document.getElementById('calls_total').textContent = m.calls_total ?? 0;
-      document.getElementById('accepted').textContent   = m.offers_accepted ?? 0;
-      document.getElementById('rejected').textContent   = m.offers_rejected ?? 0;
-      document.getElementById('avg_rounds').textContent = (j.avg_negotiation_rounds ?? '–');
+      elCalls.textContent = j.calls_logged ?? 0;
+      elAcc.textContent   = j.accepted_in_range ?? 0;
+      elRej.textContent   = j.rejected_in_range ?? 0;
+      elAvg.textContent   = (j.avg_negotiation_rounds ?? '–');
 
-      const tb = document.getElementById('tbody');
-      tb.innerHTML = '';
+      // Tabla
+      elTbody.innerHTML = '';
       (j.recent_calls||[]).slice().reverse().forEach(r=>{
         const tr = document.createElement('tr');
         const acc = r.accepted === true ? '<span class="ok">Yes</span>' : (r.accepted === false ? '<span class="bad">No</span>' : '<span class="muted">–</span>');
@@ -451,12 +556,95 @@ def dashboard_page():
           <td>${r.sentiment ?? ''}</td>
           <td class="muted">${ent}</td>
         `;
-        tb.appendChild(tr);
+        elTbody.appendChild(tr);
       });
 
-      document.getElementById('foot').textContent = 'Updated at ' + (new Date()).toLocaleTimeString();
+      // Chart (grouped bars)
+      drawChart(j.daily_counts || []);
+      elFoot.textContent = 'Updated at ' + (new Date()).toLocaleTimeString();
     }
 
+    function drawChart(rows){
+      // Clear
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+      // Padding and sizes
+      const W = canvas.width, H = canvas.height;
+      const padL = 60, padR = 20, padT = 20, padB = 60;
+      const plotW = W - padL - padR;
+      const plotH = H - padT - padB;
+
+      // Prepare data
+      const labels = rows.map(r => r.date);
+      const acc = rows.map(r => r.accepted || 0);
+      const rej = rows.map(r => r.rejected || 0);
+      const maxY = Math.max(1, ...acc, ...rej);
+
+      // Axes
+      ctx.strokeStyle = '#e5e7eb';
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.moveTo(padL, padT);
+      ctx.lineTo(padL, padT + plotH);
+      ctx.lineTo(padL + plotW, padT + plotH);
+      ctx.stroke();
+
+      // Y ticks (5)
+      ctx.fillStyle = '#6b7280';
+      ctx.font = '12px system-ui';
+      const ticks = 5;
+      for(let i=0;i<=ticks;i++){
+        const yVal = Math.round(maxY * i / ticks);
+        const y = padT + plotH - (plotH * i / ticks);
+        ctx.fillText(String(yVal), padL - 30, y + 4);
+        ctx.strokeStyle = '#f3f4f6';
+        ctx.beginPath();
+        ctx.moveTo(padL, y);
+        ctx.lineTo(padL + plotW, y);
+        ctx.stroke();
+      }
+
+      // Bars
+      const n = labels.length;
+      if(n === 0){
+        ctx.fillStyle = '#6b7280';
+        ctx.fillText('No data for selected range', padL + 10, padT + 20);
+        return;
+      }
+
+      // For each day: group width, two bars (accepted=blue, rejected=red)
+      const groupGap = 16;
+      const barGap = 8;
+      const groupW = Math.max(12, plotW / n - groupGap);
+      const barW = Math.max(8, (groupW - barGap) / 2);
+
+      for(let i=0;i<n;i++){
+        const x0 = padL + i * (groupW + groupGap);
+        // accepted bar
+        const hA = (acc[i] / maxY) * plotH;
+        const yA = padT + plotH - hA;
+        ctx.fillStyle = '#3b82f6'; // blue
+        ctx.fillRect(x0, yA, barW, hA);
+        // rejected bar
+        const hR = (rej[i] / maxY) * plotH;
+        const yR = padT + plotH - hR;
+        ctx.fillStyle = '#ef4444'; // red
+        ctx.fillRect(x0 + barW + barGap, yR, barW, hR);
+
+        // x labels (rotate a little if too many)
+        ctx.fillStyle = '#374151';
+        ctx.save();
+        ctx.translate(x0 + groupW/2, padT + plotH + 16);
+        if(n > 10){ ctx.rotate(-Math.PI/6); }
+        ctx.textAlign = 'center';
+        ctx.fillText(labels[i], 0, 0);
+        ctx.restore();
+      }
+    }
+
+    // Events
+    elApply.addEventListener('click', loadData);
+    // Initial load + auto-refresh
     loadData();
     setInterval(loadData, 5000);
   </script>
@@ -466,15 +654,33 @@ def dashboard_page():
     return HTMLResponse(html)
 
 @app.get("/dashboard/data", response_class=JSONResponse)
-def dashboard_data():
+def dashboard_data(
+    from_date: Optional[str] = Query(default=None, alias="from"),
+    to_date: Optional[str] = Query(default=None, alias="to"),
+):
     _assert_public_dashboard()
-    return JSONResponse(build_metrics_payload())
+    f, t = _parse_range_params(from_date, to_date)
+    # filtrar
+    filtered = _filter_calls_by_date(call_results, f, t)
+    # agregación diaria
+    daily = _aggregate_by_day(filtered)
+    # contadores in-range
+    acc = sum(1 for r in filtered if r.get("accepted") is True)
+    rej = sum(1 for r in filtered if r.get("accepted") is False)
+
+    payload = build_metrics_payload(filtered)
+    # añadimos campos específicos del dashboard dinámico
+    payload.update({
+        "accepted_in_range": acc,
+        "rejected_in_range": rej,
+        "daily_counts": daily
+    })
+    return JSONResponse(payload)
 
 # -------------------------
 # Root
 # -------------------------
 @app.get("/")
 def root():
-    return {"message": "Inbound Carrier Agent running - V8 (realistic + dashboard)"}
-
+    return {"message": "Inbound Carrier Agent running - V9 (dashboard + date filters)"}
 
