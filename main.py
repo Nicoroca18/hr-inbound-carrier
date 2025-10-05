@@ -1,6 +1,6 @@
 """
 main.py - Inbound Carrier Agent API (FastAPI)
-Realistic negotiation + Dashboard with grouped bar chart, date filters, and quick-range buttons
+Realistic negotiation + Dashboard with grouped bar chart, date filters, quick ranges, no flicker, acceptance rate KPI
 
 Endpoints:
 - POST /api/authenticate
@@ -421,6 +421,7 @@ def dashboard_page():
     .controls button{padding:8px 12px;border:1px solid #111;border-radius:8px;background:#111;color:#fff;cursor:pointer}
     .quick{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
     .quick button{background:#2563eb;border-color:#2563eb}
+    .status{min-width:120px;display:inline-block;color:#6b7280} /* evita saltos de layout */
     canvas{border:1px solid #e5e7eb;border-radius:12px;max-width:100%}
     table{width:100%;border-collapse:collapse;margin-top:12px}
     th,td{border-bottom:1px solid #e5e7eb;padding:8px 10px;text-align:left;font-size:14px}
@@ -447,7 +448,7 @@ def dashboard_page():
       <input id="to" type="date" />
     </div>
     <button id="apply">Apply filters</button>
-    <span class="muted" id="status"></span>
+    <span class="status" id="status"></span>
     <div class="quick">
       <span class="label" style="margin-left:12px">Quick ranges:</span>
       <button id="q7">Last 7 days</button>
@@ -462,6 +463,7 @@ def dashboard_page():
     <div class="card"><div class="label">Calls (in range)</div><div id="calls_total" class="value">–</div></div>
     <div class="card"><div class="label">Accepted</div><div id="accepted" class="value">–</div></div>
     <div class="card"><div class="label">Rejected</div><div id="rejected" class="value">–</div></div>
+    <div class="card"><div class="label">Acceptance rate</div><div id="acc_rate" class="value">–</div></div>
     <div class="card"><div class="label">Avg rounds (global)</div><div id="avg_rounds" class="value">–</div></div>
   </div>
 
@@ -497,6 +499,7 @@ def dashboard_page():
     const elCalls = document.getElementById('calls_total');
     const elAcc = document.getElementById('accepted');
     const elRej = document.getElementById('rejected');
+    const elAccRate = document.getElementById('acc_rate');
     const elAvg = document.getElementById('avg_rounds');
     const elTbody = document.getElementById('tbody');
     const elFoot = document.getElementById('foot');
@@ -509,6 +512,8 @@ def dashboard_page():
     const btnToday = document.getElementById('qToday');
     const btnClear = document.getElementById('qClear');
 
+    let isLoading = false; // evita solapes (flicker)
+
     function fmtYmdUTC(d){
       const y = d.getUTCFullYear();
       const m = String(d.getUTCMonth()+1).padStart(2,'0');
@@ -517,7 +522,6 @@ def dashboard_page():
     }
 
     function setRangeDays(days){
-      // days=7 -> from=today-6, to=today  (inclusive)
       const now = new Date();
       const to = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()));
       const from = new Date(to);
@@ -551,40 +555,55 @@ def dashboard_page():
     }
 
     async function loadData(){
-      const url = '/dashboard/data' + qs();
+      if (isLoading) return; // evita doble refresh
+      isLoading = true;
+      // mantenemos el ancho del status con CSS; sólo cambiamos opacidad visible con texto breve
       elStatus.textContent = 'Loading…';
-      const res = await fetch(url);
-      if(!res.ok){ elStatus.textContent = 'Error ' + res.status; return; }
-      const j = await res.json();
-      elStatus.textContent = '';
+      const url = '/dashboard/data' + qs();
+      try{
+        const res = await fetch(url);
+        if(!res.ok){ elStatus.textContent = 'Error ' + res.status; isLoading = false; return; }
+        const j = await res.json();
 
-      // KPIs
-      const m = j.metrics || {};
-      elCalls.textContent = j.calls_logged ?? 0;
-      elAcc.textContent   = j.accepted_in_range ?? 0;
-      elRej.textContent   = j.rejected_in_range ?? 0;
-      elAvg.textContent   = (j.avg_negotiation_rounds ?? '–');
+        // KPIs
+        const callsInRange = j.calls_logged ?? 0;
+        const acceptedInRange = j.accepted_in_range ?? 0;
+        const rejectedInRange = j.rejected_in_range ?? 0;
+        elCalls.textContent = callsInRange;
+        elAcc.textContent   = acceptedInRange;
+        elRej.textContent   = rejectedInRange;
 
-      // Table
-      elTbody.innerHTML = '';
-      (j.recent_calls||[]).slice().reverse().forEach(r=>{
-        const tr = document.createElement('tr');
-        const acc = r.accepted === true ? '<span class="ok">Yes</span>' : (r.accepted === false ? '<span class="bad">No</span>' : '<span class="muted">–</span>');
-        const ent = r.entities ? `mc:${r.entities.mc_number ?? ''} price:${r.entities.price ?? ''} load:${r.entities.load_id ?? ''}` : '';
-        tr.innerHTML = `
-          <td>${r.ts ?? ''}</td>
-          <td>${r.mc_number ?? ''}</td>
-          <td>${r.load_id ?? ''}</td>
-          <td>${(r.final_price ?? '')}</td>
-          <td>${acc}</td>
-          <td>${r.sentiment ?? ''}</td>
-          <td class="muted">${ent}</td>
-        `;
-        elTbody.appendChild(tr);
-      });
+        const rate = callsInRange > 0 ? ((acceptedInRange / callsInRange) * 100).toFixed(1) + '%' : '–';
+        elAccRate.textContent = rate;
 
-      drawChart(j.daily_counts || []);
-      elFoot.textContent = 'Updated at ' + (new Date()).toLocaleTimeString();
+        elAvg.textContent   = (j.avg_negotiation_rounds ?? '–');
+
+        // Table
+        elTbody.innerHTML = '';
+        (j.recent_calls||[]).slice().reverse().forEach(r=>{
+          const tr = document.createElement('tr');
+          const acc = r.accepted === true ? '<span class="ok">Yes</span>' : (r.accepted === false ? '<span class="bad">No</span>' : '<span class="muted">–</span>');
+          const ent = r.entities ? `mc:${r.entities.mc_number ?? ''} price:${r.entities.price ?? ''} load:${r.entities.load_id ?? ''}` : '';
+          tr.innerHTML = `
+            <td>${r.ts ?? ''}</td>
+            <td>${r.mc_number ?? ''}</td>
+            <td>${r.load_id ?? ''}</td>
+            <td>${(r.final_price ?? '')}</td>
+            <td>${acc}</td>
+            <td>${r.sentiment ?? ''}</td>
+            <td class="muted">${ent}</td>
+          `;
+          elTbody.appendChild(tr);
+        });
+
+        drawChart(j.daily_counts || []);
+        elFoot.textContent = 'Updated at ' + (new Date()).toLocaleTimeString();
+        elStatus.textContent = ''; // queda espacio reservado por CSS
+      } catch(e){
+        elStatus.textContent = 'Error';
+      } finally{
+        isLoading = false;
+      }
     }
 
     function drawChart(rows){
@@ -668,7 +687,7 @@ def dashboard_page():
     btnToday.addEventListener('click', setToday);
     btnClear.addEventListener('click', clearFilters);
 
-    // Initial load + auto-refresh
+    // Initial load + auto-refresh (no flicker thanks to isLoading + fixed status width)
     loadData();
     setInterval(loadData, 5000);
   </script>
@@ -702,4 +721,4 @@ def dashboard_data(
 # -------------------------
 @app.get("/")
 def root():
-    return {"message": "Inbound Carrier Agent running - V10 (dashboard + quick ranges)"}
+    return {"message": "Inbound Carrier Agent running - V11 (dashboard no flicker + acceptance rate)"}
