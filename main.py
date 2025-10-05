@@ -1,12 +1,12 @@
 """
-main.py - Inbound Carrier Agent API (Slim)
-- Endpoints usados por el workflow: /api/authenticate, /api/loads, /api/negotiate, /api/call/result
-- Dashboard: /dashboard (html) y /dashboard/data (json)
-- Refresh del dashboard silencioso (sin "Loading")
+main.py - Inbound Carrier Agent API (V15 Dashboard+)
+- Endpoints workflow: /api/authenticate, /api/loads, /api/negotiate, /api/call/result
+- Dashboard mejorado: KPIs nuevas, tabla con Board price, columnas más finas y PIE chart (Total $ vs Accepted $)
+- Refresh silencioso cada 5s
 
 Notas:
-- FMCSA en modo "auto": si hay FMCSA_WEBKEY intenta real; si falla o no hay key, usa mock permisivo.
-- Negociación realista: el carrier pide MÁS que el board; aceptamos si <= techo (board * (1 + MAX_OVER_PCT)).
+- FMCSA "auto": si hay key intenta real; si falla o no hay key, mock permisivo.
+- Negociación realista: carrier pide MÁS que el board; se acepta si oferta <= techo (board * (1 + MAX_OVER_PCT)).
 """
 
 import os
@@ -26,27 +26,23 @@ from pydantic import BaseModel
 API_KEY = os.getenv("API_KEY", "test-api-key")
 
 FMCSA_WEBKEY = os.getenv("FMCSA_WEBKEY", "")
-# En slim, usamos "auto" siempre (intenta real; si falla o no hay key, mock)
 FMCSA_BASE_URL = "https://mobile.fmcsa.dot.gov/qc/services/"
 
 LOADS_FILE = os.getenv("LOADS_FILE", "./data/loads.json")
 MAX_OVER_PCT = float(os.getenv("MAX_OVER_PCT", "0.10"))  # techo = board * (1 + 10%)
 PUBLIC_DASHBOARD = os.getenv("PUBLIC_DASHBOARD", "false").lower() == "true"
 
-# NLP de /api/call/result (extraer entidades y sentimiento del transcript) se puede desactivar:
+# NLP del transcript en /api/call/result
 ENABLE_NLP = os.getenv("ENABLE_NLP", "true").lower() == "true"
 
 # -------------------------
 # App & Stores
 # -------------------------
-app = FastAPI(title="HappyRobot - Inbound Carrier API (Slim)")
+app = FastAPI(title="HappyRobot - Inbound Carrier API (V15 Dashboard+)")
 
-# Estado de negociación: key = f"{mc}:{load_id}"
-negotiations: Dict[str, Dict[str, Any]] = {}
-# Log de resultados de llamadas (para el dashboard)
-call_results: List[Dict[str, Any]] = []
+negotiations: Dict[str, Dict[str, Any]] = {}     # key = f"{mc}:{load_id}"
+call_results: List[Dict[str, Any]] = []          # para dashboard
 
-# Métricas mínimas (para KPIs y cálculo de avg rounds)
 metrics = {
     "calls_total": 0,
     "offers_accepted": 0,
@@ -68,7 +64,6 @@ class LoadOut(BaseModel):
     delivery_datetime: str
     equipment_type: str
     loadboard_rate: float
-    # Campos extra opcionales soportados por tu loads.json
     notes: Optional[str] = None
     weight: Optional[float] = None
     commodity_type: Optional[str] = None
@@ -141,7 +136,6 @@ def simple_sentiment(text: str) -> str:
     neg = sum(t.count(tok) for tok in ["no", "not", "reject", "angry", "bad", "hate", "problem", "can't", "cannot"])
     return "positive" if pos > neg else ("negative" if neg > pos else "neutral")
 
-# FMCSA auto: intenta real; si falla o no hay key, mock permisivo
 _fmcsa_cache: Dict[str, Dict[str, Any]] = {}
 CACHE_TTL_SECONDS = 24 * 3600
 
@@ -161,7 +155,6 @@ def fmcs_lookup_by_mc(mc_number: str) -> Dict[str, Any]:
     if entry and (time.time() - entry["ts"] < CACHE_TTL_SECONDS):
         return entry["data"]
 
-    # Si no hay key o falla el real → mock
     if not FMCSA_WEBKEY:
         data = _mock_snapshot(mc)
         _fmcsa_cache[mc] = {"ts": time.time(), "data": data}
@@ -193,7 +186,7 @@ def authenticate(carrier: CarrierIn):
     if isinstance(snapshot, dict):
         allow = snapshot.get("allowToOperate")
         out = snapshot.get("outOfService")
-        # Si FMCSA real devolviera denegado, respétalo; en mock dejamos pasar
+        # Respeta denegación real; mock deja pasar
         if snapshot.get("source") != "mock":
             if str(allow).lower() not in ("y", "yes", "true") or str(out).lower() in ("y", "yes", "true"):
                 allowed = False
@@ -221,7 +214,7 @@ def negotiate(payload: NegotiateIn):
     - listed = board rate (lo que publicas)
     - ceiling = listed * (1 + MAX_OVER_PCT)
     - El carrier pide MÁS que el board; aceptamos si su oferta <= ceiling.
-    - Si oferta > ceiling y aún hay rondas, nuestra contra es 'ceiling'.
+    - Si oferta > ceiling y aún hay rondas, contra = ceiling.
     - Máx 3 rondas; si no hay acuerdo, rechazamos.
     """
     key = f"{payload.mc_number}:{payload.load_id}"
@@ -264,8 +257,8 @@ def negotiate(payload: NegotiateIn):
 @app.post("/api/call/result", dependencies=[Depends(require_api_key)])
 def call_result(payload: CallResultIn):
     """
-    Registra el resultado de la llamada (para dashboard y auditoría ligera).
-    Si ENABLE_NLP=true, intenta extraer MC/price/load_id del transcript y calcula sentimiento simple.
+    Registra el resultado de la llamada para el dashboard y auditoría ligera.
+    Guarda board_rate de la carga (si load_id existe) para mostrarlo en la tabla.
     """
     entities = extract_entities_from_text(payload.transcript or "")
     sentiment = simple_sentiment(payload.transcript or "")
@@ -278,13 +271,26 @@ def call_result(payload: CallResultIn):
         except HTTPException:
             final_price_val = None
 
+    # Buscar board_rate por load_id (si existe)
+    board_rate_val: Optional[float] = None
+    the_load_id = payload.load_id or entities.get("load_id")
+    if the_load_id:
+        loads = load_loads()
+        ld = next((l for l in loads if str(l.get("load_id")).strip() == str(the_load_id).strip()), None)
+        if ld:
+            try:
+                board_rate_val = float(ld.get("loadboard_rate"))
+            except Exception:
+                board_rate_val = None
+
     record = {
         "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "mc_number": payload.mc_number or entities.get("mc_number"),
-        "load_id": payload.load_id or entities.get("load_id"),
+        "load_id": the_load_id,
         "final_price": final_price_val,
         "accepted": payload.accepted,
         "sentiment": sentiment,
+        "board_rate": board_rate_val,     # <-- para la tabla
         "entities": entities,
         "transcript": payload.transcript,
     }
@@ -325,20 +331,38 @@ def _aggregate_by_day(calls: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         elif acc is False: bucket["rejected"] += 1
     return [{"date": d, **agg[d]} for d in sorted(agg.keys())]
 
-def _build_metrics_payload(filtered_calls: List[Dict[str, Any]]) -> Dict[str, Any]:
+def _build_metrics_payload(filtered_calls: List[Dict[str, Any]]) -> Dict[str, Any]]:
+    # Totales en el rango
     total_accepted = sum(1 for r in filtered_calls if r.get("accepted") is True)
     total_rejected = sum(1 for r in filtered_calls if r.get("accepted") is False)
-    total = total_accepted + total_rejected
-    avg_rounds = (metrics["negotiation_rounds_total"] / total) if total > 0 else None
+    calls_in_range = total_accepted + total_rejected
+
+    # Sumas de precios finales
+    total_final_sum = sum((r.get("final_price") or 0) for r in filtered_calls if r.get("final_price") is not None)
+    accepted_final_sum = sum((r.get("final_price") or 0) for r in filtered_calls if r.get("accepted") is True and r.get("final_price") is not None)
+
+    # Board-match: final_price == board_rate y aceptado
+    board_match_acc_count = sum(
+        1 for r in filtered_calls
+        if r.get("accepted") is True
+        and r.get("final_price") is not None
+        and r.get("board_rate") is not None
+        and float(r.get("final_price")) == float(r.get("board_rate"))
+    )
+    board_match_rate_pct = (board_match_acc_count / calls_in_range * 100.0) if calls_in_range > 0 else None
+
     return {
         "metrics": {
             "calls_total": metrics["calls_total"],
             "offers_accepted": metrics["offers_accepted"],
             "offers_rejected": metrics["offers_rejected"],
         },
-        "avg_negotiation_rounds": avg_rounds,
-        "calls_logged": len(filtered_calls),
+        "calls_logged": calls_in_range,
         "recent_calls": filtered_calls[-10:],
+        "total_final_sum": round(total_final_sum, 2),
+        "accepted_final_sum": round(accepted_final_sum, 2),
+        "board_match_accepted_count": board_match_acc_count,
+        "board_match_rate_percent": round(board_match_rate_pct, 1) if board_match_rate_pct is not None else None,
     }
 
 # -------------------------
@@ -355,25 +379,32 @@ def dashboard_page():
   <meta name="viewport" content="width=device-width,initial-scale=1" />
   <title>HR PoC Metrics</title>
   <style>
-    body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;margin:24px;color:#111}
+    :root{
+      --fg:#111; --muted:#6b7280; --line:#e5e7eb; --soft:#f3f4f6;
+      --blue:#3b82f6; --red:#ef4444; --green:#16a34a; --indigo:#6366f1;
+    }
+    body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;margin:24px;color:var(--fg);background:#fff}
     h1{margin:0 0 16px}
-    .kpis{display:flex;gap:16px;flex-wrap:wrap;margin:16px 0}
-    .card{border:1px solid #e5e7eb;border-radius:12px;padding:12px 16px;min-width:180px;box-shadow:0 1px 2px rgba(0,0,0,.04)}
-    .label{font-size:12px;color:#6b7280;text-transform:uppercase;letter-spacing:.04em}
+    .kpis{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:16px;margin:16px 0}
+    .card{border:1px solid var(--line);border-radius:12px;padding:12px 16px;box-shadow:0 1px 2px rgba(0,0,0,.04);background:#fff}
+    .label{font-size:12px;color:var(--muted);text-transform:uppercase;letter-spacing:.04em}
     .value{font-size:24px;font-weight:600}
-    .controls{display:flex;gap:12px;align-items:center;margin:8px 0 16px;flex-wrap:wrap}
-    .controls input{padding:6px 8px;border:1px solid #e5e7eb;border-radius:8px}
+    .controls{display:flex;gap:12px;align-items:flex-end;margin:8px 0 16px;flex-wrap:wrap}
+    .controls input{padding:6px 8px;border:1px solid var(--line);border-radius:8px}
     .controls button{padding:8px 12px;border:1px solid #111;border-radius:8px;background:#111;color:#fff;cursor:pointer}
     .quick{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
-    .quick button{background:#2563eb;border-color:#2563eb;color:#fff;border:none;padding:8px 12px;border-radius:8px;cursor:pointer}
-    canvas{border:1px solid #e5e7eb;border-radius:12px;max-width:100%}
-    table{width:100%;border-collapse:collapse;margin-top:12px}
-    th,td{border-bottom:1px solid #e5e7eb;padding:8px 10px;text-align:left;font-size:14px}
+    .quick button{background:var(--indigo);border-color:var(--indigo);color:#fff;border:none;padding:8px 12px;border-radius:8px;cursor:pointer}
+    .row{display:grid;grid-template-columns: 2fr 1fr; gap:16px; align-items:start}
+    canvas{border:1px solid var(--line);border-radius:12px;max-width:100%;background:#fff}
+    table{width:100%;border-collapse:collapse;margin-top:12px;background:#fff}
+    th,td{border-bottom:1px solid var(--line);padding:10px 12px;text-align:left;font-size:14px}
     th{background:#f9fafb;color:#374151}
     tr:hover{background:#f8fafc}
-    .ok{color:#16a34a;font-weight:600}
-    .bad{color:#dc2626;font-weight:600}
-    .muted{color:#6b7280}
+    .ok{color:var(--green);font-weight:600}
+    .bad{color:var(--red);font-weight:600}
+    .muted{color:var(--muted)}
+    .legend{display:flex;gap:16px;align-items:center;margin:8px 0}
+    .swatch{display:inline-block;width:12px;height:12px;border-radius:2px;margin-right:6px;vertical-align:middle}
   </style>
 </head>
 <body>
@@ -404,10 +435,24 @@ def dashboard_page():
     <div class="card"><div class="label">Accepted</div><div id="accepted" class="value">–</div></div>
     <div class="card"><div class="label">Rejected</div><div id="rejected" class="value">–</div></div>
     <div class="card"><div class="label">Acceptance rate</div><div id="acc_rate" class="value">–</div></div>
-    <div class="card"><div class="label">Avg rounds (global)</div><div id="avg_rounds" class="value">–</div></div>
+    <div class="card"><div class="label">Total $ (all finals)</div><div id="sum_all" class="value">–</div></div>
+    <div class="card"><div class="label">Accepted $</div><div id="sum_acc" class="value">–</div></div>
+    <div class="card"><div class="label">Board-match accepted (#)</div><div id="board_match_count" class="value">–</div></div>
+    <div class="card"><div class="label">Board-match rate</div><div id="board_match_rate" class="value">–</div></div>
   </div>
 
-  <canvas id="chart" width="1100" height="360"></canvas>
+  <div class="row">
+    <div>
+      <div class="legend">
+        <span><span class="swatch" style="background:#3b82f6"></span>Accepted</span>
+        <span><span class="swatch" style="background:#ef4444"></span>Rejected</span>
+      </div>
+      <canvas id="chartBars" width="1100" height="360"></canvas>
+    </div>
+    <div>
+      <canvas id="chartPie" width="420" height="360"></canvas>
+    </div>
+  </div>
 
   <h2>Recent calls (in range)</h2>
   <table>
@@ -416,10 +461,10 @@ def dashboard_page():
         <th>Timestamp (UTC)</th>
         <th>MC</th>
         <th>Load</th>
-        <th>Final Price</th>
+        <th>Board price</th>
+        <th>Final price</th>
         <th>Accepted</th>
         <th>Sentiment</th>
-        <th class="muted">Extracted</th>
       </tr>
     </thead>
     <tbody id="tbody"></tbody>
@@ -434,11 +479,16 @@ def dashboard_page():
     const elAcc  = document.getElementById('accepted');
     const elRej  = document.getElementById('rejected');
     const elRate = document.getElementById('acc_rate');
-    const elAvg  = document.getElementById('avg_rounds');
+
+    const elSumAll = document.getElementById('sum_all');
+    const elSumAcc = document.getElementById('sum_acc');
+    const elBMatchCount = document.getElementById('board_match_count');
+    const elBMatchRate  = document.getElementById('board_match_rate');
+
     const elTbody= document.getElementById('tbody');
 
-    const canvas = document.getElementById('chart');
-    const ctx = canvas.getContext('2d');
+    const ctxBars = document.getElementById('chartBars').getContext('2d');
+    const ctxPie  = document.getElementById('chartPie').getContext('2d');
 
     const btn7 = document.getElementById('q7');
     const btn14= document.getElementById('q14');
@@ -496,38 +546,44 @@ def dashboard_page():
         elAcc.textContent   = acc;
         elRej.textContent   = rej;
         elRate.textContent  = calls ? ((acc / calls) * 100).toFixed(1) + '%' : '–';
-        elAvg.textContent   = (j.avg_negotiation_rounds ?? '–');
+
+        elSumAll.textContent = '$' + (j.total_final_sum ?? 0).toLocaleString();
+        elSumAcc.textContent = '$' + (j.accepted_final_sum ?? 0).toLocaleString();
+
+        elBMatchCount.textContent = (j.board_match_accepted_count ?? 0);
+        elBMatchRate.textContent  = (j.board_match_rate_percent != null) ? (j.board_match_rate_percent.toFixed(1) + '%') : '–';
 
         // Tabla
         elTbody.innerHTML = '';
         (j.recent_calls||[]).slice().reverse().forEach(r=>{
           const tr = document.createElement('tr');
-          const accTxt = r.accepted === true ? 'Yes' : (r.accepted === false ? 'No' : '–');
-          const ent = r.entities ? `mc:${r.entities.mc_number ?? ''} price:${r.entities.price ?? ''} load:${r.entities.load_id ?? ''}` : '';
+          const accTxt = r.accepted === true ? '<span class="ok">Yes</span>' : (r.accepted === false ? '<span class="bad">No</span>' : '<span class="muted">–</span>');
           tr.innerHTML = `
             <td>${r.ts ?? ''}</td>
             <td>${r.mc_number ?? ''}</td>
             <td>${r.load_id ?? ''}</td>
-            <td>${r.final_price ?? ''}</td>
+            <td>${r.board_rate != null ? ('$'+ Number(r.board_rate).toLocaleString()) : ''}</td>
+            <td>${r.final_price != null ? ('$'+ Number(r.final_price).toLocaleString()) : ''}</td>
             <td>${accTxt}</td>
             <td>${r.sentiment ?? ''}</td>
-            <td class="muted">${ent}</td>
           `;
           elTbody.appendChild(tr);
         });
 
-        // Gráfico (barras aceptadas/rechazadas por día)
-        drawChart(j.daily_counts || []);
+        drawBars(j.daily_counts || []);
+        drawPie(j.total_final_sum || 0, j.accepted_final_sum || 0);
       } finally{
         isLoading = false;
       }
     }
 
-    function drawChart(rows){
-      ctx.clearRect(0, 0, canvas.width, canvas.height);
-      const W=canvas.width, H=canvas.height;
+    function drawBars(rows){
+      const ctx = ctxBars;
+      const W=ctx.canvas.width, H=ctx.canvas.height;
+      ctx.clearRect(0,0,W,H);
       const padL=60, padR=20, padT=20, padB=60;
       const plotW=W-padL-padR, plotH=H-padT-padB;
+
       const labels=rows.map(r=>r.date);
       const acc=rows.map(r=>r.accepted||0);
       const rej=rows.map(r=>r.rejected||0);
@@ -537,7 +593,7 @@ def dashboard_page():
       ctx.strokeStyle='#e5e7eb'; ctx.lineWidth=1;
       ctx.beginPath(); ctx.moveTo(padL, padT); ctx.lineTo(padL, padT+plotH); ctx.lineTo(padL+plotW, padT+plotH); ctx.stroke();
 
-      // ticks Y
+      // grid Y
       ctx.fillStyle='#6b7280'; ctx.font='12px system-ui';
       const ticks=5;
       for(let i=0;i<=ticks;i++){
@@ -550,22 +606,67 @@ def dashboard_page():
       const n=labels.length;
       if(n===0){ ctx.fillStyle='#6b7280'; ctx.fillText('No data for selected range', padL+10, padT+20); return; }
 
-      const groupGap=16, barGap=8;
-      const groupW=Math.max(12, plotW/n - groupGap);
-      const barW=Math.max(8, (groupW - barGap)/2);
+      // Barras finas y más bonitas
+      const groupGap = 24;                 // más espacio entre grupos
+      const groupW   = Math.max(18, plotW/n - groupGap);
+      const barGap   = 6;
+      const barW     = Math.max(6, (groupW - barGap)/2);  // barras más finas
 
       for(let i=0;i<n;i++){
         const x0=padL + i*(groupW+groupGap);
+
         // accepted
         const hA=(acc[i]/maxY)*plotH, yA=padT+plotH-hA;
-        ctx.fillStyle='#3b82f6'; ctx.fillRect(x0, yA, barW, hA);
+        ctx.fillStyle='#3b82f6';
+        ctx.fillRect(x0, yA, barW, hA);
+
         // rejected
         const hR=(rej[i]/maxY)*plotH, yR=padT+plotH-hR;
-        ctx.fillStyle='#ef4444'; ctx.fillRect(x0+barW+barGap, yR, barW, hR);
-        // etiquetas X
+        ctx.fillStyle='#ef4444';
+        ctx.fillRect(x0+barW+barGap, yR, barW, hR);
+
+        // etiquetas X (rotación si hay muchas)
         ctx.fillStyle='#374151'; ctx.save(); ctx.translate(x0+groupW/2, padT+plotH+16);
-        if(n>10){ ctx.rotate(-Math.PI/6); } ctx.textAlign='center'; ctx.fillText(labels[i], 0, 0); ctx.restore();
+        if(n>10){ ctx.rotate(-Math.PI/6); }
+        ctx.textAlign='center'; ctx.fillText(labels[i], 0, 0); ctx.restore();
       }
+    }
+
+    function drawPie(totalAll, totalAcc){
+      const ctx = ctxPie;
+      const W=ctx.canvas.width, H=ctx.canvas.height;
+      ctx.clearRect(0,0,W,H);
+
+      const cx=W/2, cy=H/2, r=Math.min(W,H)*0.35;
+      const values = [totalAcc, Math.max(0, totalAll - totalAcc)];
+      const colors = ['#16a34a','#9ca3af']; // aceptado verde, resto gris
+      const labels = ['Accepted $','Others $'];
+
+      const sum = values.reduce((a,b)=>a+b,0);
+      if(sum <= 0){
+        ctx.fillStyle='#6b7280'; ctx.font='14px system-ui';
+        ctx.fillText('No amounts in selected range', cx-100, cy);
+        return;
+      }
+
+      let start = -Math.PI/2;
+      for(let i=0;i<values.length;i++){
+        const angle = (values[i]/sum) * Math.PI*2;
+        ctx.beginPath();
+        ctx.moveTo(cx,cy);
+        ctx.fillStyle = colors[i];
+        ctx.arc(cx,cy,r,start,start+angle);
+        ctx.closePath();
+        ctx.fill();
+        start += angle;
+      }
+
+      // Leyenda sencilla
+      ctx.font='12px system-ui'; ctx.fillStyle='#374151';
+      ctx.fillRect(20, 20, 12, 12); ctx.fillStyle=colors[0]; ctx.fillRect(20,20,12,12);
+      ctx.fillStyle='#374151'; ctx.fillText(`${labels[0]}: $${Number(values[0]).toLocaleString()}`, 40, 30);
+      ctx.fillStyle='#9ca3af'; ctx.fillRect(20, 40, 12, 12);
+      ctx.fillStyle='#374151'; ctx.fillText(`${labels[1]}: $${Number(values[1]).toLocaleString()}`, 40, 50);
     }
 
     // Eventos
@@ -594,9 +695,12 @@ def dashboard_data(
     f, t = _parse_range_params(from_date, to_date)
     filtered = _filter_calls_by_date(call_results, f, t)
     daily = _aggregate_by_day(filtered)
+
+    # totales básicos (necesarios para KPIs clásicos)
     acc = sum(1 for r in filtered if r.get("accepted") is True)
     rej = sum(1 for r in filtered if r.get("accepted") is False)
 
+    # payload extendido con nuevas métricas
     payload = _build_metrics_payload(filtered)
     payload.update({
         "accepted_in_range": acc,
@@ -610,4 +714,5 @@ def dashboard_data(
 # -------------------------
 @app.get("/")
 def root():
-    return {"message": "Inbound Carrier Agent running - V14 Slim"}
+    return {"message": "Inbound Carrier Agent - HappyRobot"}
+
