@@ -1,16 +1,25 @@
 """
-main.py - Inbound Carrier Agent API (FastAPI)
+main.py - Inbound Carrier Agent API (FastAPI) - Realistic negotiation
 
 Endpoints:
-- POST /api/authenticate  -> { mc_number }           (FMCSA real o fallback mock según FMCSA_MODE)
+- POST /api/authenticate  -> { mc_number }           (FMCSA real / auto / mock)
 - GET  /api/loads         -> lista de cargas (data/loads.json)
-- POST /api/negotiate     -> { mc_number, load_id, offer } (hasta 3 rondas)
+- POST /api/negotiate     -> { mc_number, load_id, offer } (negociación hasta 3 rondas)
 - POST /api/call/result   -> { transcript, mc_number?, load_id?, final_price?, accepted? }
 - GET  /api/metrics       -> métricas simples (PoC)
 
-Notas clave para HappyRobot:
-- Acepta "offer" como número o string (ej. "1200", "$1,200", "twelve hundred" si la UI lo convierte a texto).
-- "Preserves data types" en tus webhooks puede ir ON u OFF; el backend soporta ambas.
+Lógica de negociación (realista):
+- El broker publica un "board rate" (ej. 1500 USD).
+- El carrier suele pedir MÁS dinero.
+- La API acepta si la oferta del carrier es <= TECHO (por defecto board * (1 + MAX_OVER_PCT)).
+- Si la oferta supera el TECHO, devolvemos nuestra contraoferta (el TECHO) y negociamos hasta 3 rondas.
+
+Vars de entorno principales:
+- API_KEY            (requerida)
+- FMCSA_WEBKEY       (opcional si FMCSA_MODE=mock)
+- FMCSA_MODE         'real' | 'auto' | 'mock'  (recomendado: 'auto')
+- LOADS_FILE         ruta del loads.json (por defecto ./data/loads.json)
+- MAX_OVER_PCT       porcentaje máximo sobre el board rate (por defecto 0.10 -> 10%)
 """
 
 import os
@@ -31,15 +40,16 @@ FMCSA_WEBKEY = os.getenv("FMCSA_WEBKEY", "")
 FMCSA_MODE = os.getenv("FMCSA_MODE", "real").lower()  # 'real' | 'auto' | 'mock'
 
 LOADS_FILE = os.getenv("LOADS_FILE", "./data/loads.json")
-MIN_ACCEPT_PCT = float(os.getenv("MIN_ACCEPT_PCT", "0.85"))  # acepta >= 85% del rate por defecto
+# Techo máximo que estás dispuesto a pagar por encima del board (p.ej. 10%):
+MAX_OVER_PCT = float(os.getenv("MAX_OVER_PCT", "0.10"))
 
 # -------------------------
 # App & memoria (PoC)
 # -------------------------
-app = FastAPI(title="HappyRobot - Inbound Carrier API")
+app = FastAPI(title="HappyRobot - Inbound Carrier API (Realistic)")
 
 # estado de negociaciones en memoria
-# key = f"{mc}:{load_id}" => { round:int, settled:bool, price:float, listed:float, history:list }
+# key = f"{mc}:{load_id}" => { round:int, settled:bool, price:float, listed:float, ceiling:float, history:list }
 negotiations: Dict[str, Dict[str, Any]] = {}
 
 # resultados de llamadas
@@ -198,12 +208,10 @@ def fmcs_lookup_by_mc(mc_number: str) -> Dict[str, Any]:
         try:
             metrics["fmcsa_real_calls"] += 1
             base = "https://mobile.fmcsa.dot.gov/qc/services/"
-            # companySnapshot admite mcNumber o usdot:
             url = f"{base}companySnapshot?webKey={FMCSA_WEBKEY}&mcNumber={mc}"
             r = requests.get(url, timeout=8)
             r.raise_for_status()
             data = r.json()
-            # normalizamos algunos campos
             if isinstance(data, dict):
                 data.setdefault("source", "FMCSA")
                 data.setdefault("degraded", False)
@@ -229,25 +237,24 @@ def fmcs_lookup_by_mc(mc_number: str) -> Dict[str, Any]:
             return data
         except Exception as e:
             metrics["fmcsa_real_errors"] += 1
-            # fallback silencioso a mock
             data = _mock_snapshot(mc)
             metrics["fmcsa_mock_uses"] += 1
             _fmcsa_cache[mc] = {"ts": time.time(), "data": data}
             return data
 
-    # si llega aquí, tratamos como mock
+    # fallback mock
     data = _mock_snapshot(mc)
     _fmcsa_cache[mc] = {"ts": time.time(), "data": data}
     return data
 
-# negociación: política de contraoferta
-def compute_counter(listed: float, offer: float, round_idx: int) -> float:
-    # 1ª ronda: punto medio; siguientes, concesión decreciente
-    if round_idx == 0:
-        return round((listed + offer) / 2, 2)
-    concession = (listed - offer) * (0.5 * (0.7 ** (round_idx - 1)))
-    counter = round(listed - concession, 2)
-    return counter
+# negociación (realista):
+# - ceiling = listed * (1 + MAX_OVER_PCT)
+# - Si offer <= ceiling => aceptamos (ideal si <= listed, pero también aceptamos <= ceiling)
+# - Si offer > ceiling y ronda < 3 => devolvemos contraoferta = ceiling (tu mejor número)
+# - Si ronda >= 3 => fin sin acuerdo
+def compute_counter_down(ceiling: float) -> float:
+    # Devolvemos directamente nuestro mejor número (ceiling)
+    return round(ceiling, 2)
 
 # -------------------------
 # Rutas
@@ -296,10 +303,12 @@ def get_loads(origin: Optional[str] = None, destination: Optional[str] = None, m
 @app.post("/api/negotiate", dependencies=[Depends(require_api_key)])
 def negotiate(payload: NegotiateIn):
     """
-    Negociación:
-      - Acepta si offer >= MIN_ACCEPT_PCT * rate listado
-      - Si no, devuelve counter_offer
-      - Máximo 3 rondas (0,1,2 -> counters; si >=3 => fin)
+    Negociación REALISTA:
+      - listed  = board rate publicado (lo que pagarías idealmente)
+      - ceiling = listed * (1 + MAX_OVER_PCT)
+      - Acepta si offer <= ceiling (mejor aún si <= listed)
+      - Si offer > ceiling y round < 3 => contraoferta = ceiling
+      - Si round >= 3 => no acuerdo
     """
     key = f"{payload.mc_number}:{payload.load_id}"
 
@@ -310,34 +319,39 @@ def negotiate(payload: NegotiateIn):
         raise HTTPException(status_code=404, detail="load not found")
 
     listed = float(load.get("loadboard_rate", 0))
-    state = negotiations.get(key, {"round": 0, "settled": False, "listed": listed, "history": []})
+    ceiling = round(listed * (1.0 + MAX_OVER_PCT), 2)
+
+    state = negotiations.get(key, {
+        "round": 0, "settled": False, "listed": listed, "ceiling": ceiling, "history": []
+    })
     if state["settled"]:
         return {"accepted": True, "price": state.get("price"), "rounds": state["round"], "note": "already settled"}
 
-    offer = parse_amount(payload.offer)  # <— robusto (str/num)
+    offer = parse_amount(payload.offer)
     state["history"].append({"type": "offer", "value": offer, "ts": time.time()})
 
-    min_accept = round(listed * MIN_ACCEPT_PCT, 2)
-    if offer >= min_accept:
+    # aceptación si está por debajo o igual al techo
+    if offer <= ceiling:
         state["settled"] = True
         state["price"] = offer
         negotiations[key] = state
         metrics["offers_accepted"] += 1
         metrics["negotiation_rounds_total"] += state["round"]
-        return {"accepted": True, "price": offer, "round": state["round"]}
+        return {"accepted": True, "price": offer, "round": state["round"], "listed": listed, "ceiling": ceiling}
 
+    # si superó el techo:
     if state["round"] >= 3:
         metrics["offers_rejected"] += 1
         metrics["negotiation_rounds_total"] += state["round"]
         state["settled"] = False
         negotiations[key] = state
-        return {"accepted": False, "reason": "max rounds reached", "round": state["round"]}
+        return {"accepted": False, "reason": "max rounds reached", "round": state["round"], "listed": listed, "ceiling": ceiling}
 
-    counter = compute_counter(listed, offer, state["round"])
+    counter = compute_counter_down(ceiling)
     state["round"] += 1
     state["history"].append({"type": "counter", "value": counter, "ts": time.time()})
     negotiations[key] = state
-    return {"accepted": False, "counter_offer": counter, "round": state["round"]}
+    return {"accepted": False, "counter_offer": counter, "round": state["round"], "listed": listed, "ceiling": ceiling}
 
 @app.post("/api/call/result", dependencies=[Depends(require_api_key)])
 def call_result(payload: CallResultIn):
@@ -352,7 +366,6 @@ def call_result(payload: CallResultIn):
         try:
             final_price_val = parse_amount(payload.final_price)
         except HTTPException:
-            # si no parsea, lo dejamos en None; no bloqueamos el log
             final_price_val = None
 
     record = {
@@ -383,8 +396,7 @@ def get_metrics():
 
 @app.get("/")
 def root():
-    return {"message": "Inbound Carrier Agent running - V6"}
-
+    return {"message": "Inbound Carrier Agent running - V7 (realistic negotiation)"}
 
 
 
